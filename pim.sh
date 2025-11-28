@@ -18,7 +18,7 @@ BOLD='\033[1m'
 # Configuration
 DEFAULT_DURATION_HOURS=1
 MAX_DURATION_HOURS=8
-CONFIG_DIR="$HOME/.config/pimler"
+CONFIG_DIR="$HOME/.config/pim"
 APP_CONFIG_FILE="$CONFIG_DIR/app.json"
 TOKEN_CACHE_FILE="$CONFIG_DIR/token.json"
 APP_NAME="PIM CLI Tool"
@@ -371,7 +371,7 @@ EOF
     # Save refresh token securely using secret-tool if available
     if [[ -n "$refresh_token" ]] && command -v secret-tool &> /dev/null; then
         echo -n "$refresh_token" | secret-tool store --label="PIM CLI Refresh Token" \
-            application pimler \
+            application pim \
             type refresh_token \
             2>/dev/null || true
     fi
@@ -380,7 +380,7 @@ EOF
 # Get refresh token from secure storage
 get_refresh_token() {
     if command -v secret-tool &> /dev/null; then
-        secret-tool lookup application pimler type refresh_token 2>/dev/null || echo ""
+        secret-tool lookup application pim type refresh_token 2>/dev/null || echo ""
     else
         echo ""
     fi
@@ -1222,7 +1222,7 @@ list_eligible_groups() {
     # Get token and user ID first (these are cached, so fast)
     local token user_id
     token=$(get_graph_token) || {
-        gum style --foreground 196 "Not logged in. Please run 'pimler login' first."
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
         return 1
     }
     user_id=$(get_graph_user_id) || {
@@ -1301,7 +1301,7 @@ list_active_groups() {
     # Get token and user ID first (cached, fast)
     local token user_id
     token=$(get_graph_token) || {
-        gum style --foreground 196 "Not logged in. Please run 'pimler login' first."
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
         return 1
     }
     user_id=$(get_graph_user_id) || {
@@ -1471,7 +1471,7 @@ interactive_activate_group() {
     # Get token and user ID first
     local token user_id
     token=$(get_graph_token) || {
-        gum style --foreground 196 "Not logged in. Please run 'pimler login' first."
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
         return 1
     }
     user_id=$(get_graph_user_id) || {
@@ -1574,7 +1574,7 @@ deactivate_group() {
     # Get token and user ID first
     local token user_id
     token=$(get_graph_token) || {
-        gum style --foreground 196 "Not logged in. Please run 'pimler login' first."
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
         return 1
     }
     user_id=$(get_graph_user_id) || {
@@ -1597,7 +1597,7 @@ deactivate_group() {
     fi
 
     local assignments
-    assignments=$(echo "$result" | jq '[.value[] | select(.assignmentType == "Activated")]')
+    assignments=$(echo "$result" | jq '.value // []')
 
     local count
     count=$(echo "$assignments" | jq 'length')
@@ -1698,14 +1698,14 @@ COMPLETIONS_DIR_ZSH="${COMPLETIONS_DIR_ZSH:-$HOME/.local/share/zsh/site-function
 
 generate_bash_completions() {
     cat << 'BASH_COMPLETIONS'
-# pimler bash completion
-_pimler() {
+# pim bash completion
+_pim() {
     local cur prev commands
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="setup grant-consent login list ls active activate a deactivate d groups groups-active group-activate ga group-deactivate gd help h install uninstall completions"
+    commands="setup grant-consent login list ls active activate a deactivate d groups help h install uninstall completions"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
@@ -1717,22 +1717,26 @@ _pimler() {
             COMPREPLY=( $(compgen -W "bash zsh install" -- "${cur}") )
             return 0
             ;;
+        groups)
+            COMPREPLY=( $(compgen -W "list ls active activate a deactivate d" -- "${cur}") )
+            return 0
+            ;;
     esac
 
     return 0
 }
 
-complete -F _pimler pimler
-complete -F _pimler pim.sh
+complete -F _pim pim
+complete -F _pim pim.sh
 BASH_COMPLETIONS
 }
 
 generate_zsh_completions() {
     cat << 'ZSH_COMPLETIONS'
-#compdef pimler pim.sh
+#compdef pim pim.sh
 
-_pimler() {
-    local -a commands
+_pim() {
+    local -a commands groups_commands
     commands=(
         'setup:Create app registration for PIM group permissions'
         'grant-consent:Grant admin consent for the app (requires admin)'
@@ -1744,17 +1748,22 @@ _pimler() {
         'a:Activate an eligible role (interactive)'
         'deactivate:Deactivate an active role'
         'd:Deactivate an active role'
-        'groups:List eligible PIM group memberships'
-        'groups-active:List currently active PIM group memberships'
-        'group-activate:Activate an eligible group membership'
-        'ga:Activate an eligible group membership'
-        'group-deactivate:Deactivate an active group membership'
-        'gd:Deactivate an active group membership'
+        'groups:Manage PIM group memberships'
         'help:Show help message'
         'h:Show help message'
-        'install:Install pimler to ~/.local/bin'
-        'uninstall:Remove pimler from ~/.local/bin'
+        'install:Install pim to ~/.local/bin'
+        'uninstall:Remove pim from ~/.local/bin'
         'completions:Manage shell completions'
+    )
+
+    groups_commands=(
+        'list:List eligible PIM group memberships'
+        'ls:List eligible PIM group memberships'
+        'active:List currently active PIM group memberships'
+        'activate:Activate an eligible group membership'
+        'a:Activate an eligible group membership'
+        'deactivate:Deactivate an active group membership'
+        'd:Deactivate an active group membership'
     )
 
     _arguments -C \
@@ -1763,24 +1772,27 @@ _pimler() {
 
     case $state in
         command)
-            _describe -t commands 'pimler commands' commands
+            _describe -t commands 'pim commands' commands
             ;;
         args)
             case $words[2] in
                 completions)
                     _values 'completion commands' 'bash[Show bash completions]' 'zsh[Show zsh completions]' 'install[Install completions]'
                     ;;
+                groups)
+                    _describe -t commands 'groups subcommands' groups_commands
+                    ;;
             esac
             ;;
     esac
 }
 
-_pimler "$@"
+_pim "$@"
 ZSH_COMPLETIONS
 }
 
 do_install() {
-    echo "Installing pimler"
+    echo "Installing pim"
     echo ""
 
     # Check dependencies before install
@@ -1826,7 +1838,7 @@ do_install() {
     gum style --foreground 35 "✓ All required dependencies found"
     echo ""
 
-    gum style --bold --foreground 212 "Installing pimler"
+    gum style --bold --foreground 212 "Installing pim"
     echo ""
 
     # Create install directory
@@ -1840,7 +1852,7 @@ do_install() {
     script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
     # Copy or symlink to install directory
-    local install_path="$INSTALL_DIR/pimler"
+    local install_path="$INSTALL_DIR/pim"
 
     if gum confirm "Create symlink (recommended for development) or copy?"; then
         ln -sf "$script_path" "$install_path"
@@ -1869,22 +1881,22 @@ do_install() {
     echo ""
     gum style --foreground 35 --bold "✓ Installation complete!"
     echo ""
-    echo "You can now run 'pimler' from anywhere."
+    echo "You can now run 'pim' from anywhere."
 }
 
 do_uninstall() {
-    gum style --bold --foreground 212 "Uninstalling pimler"
+    gum style --bold --foreground 212 "Uninstalling pim"
     echo ""
 
-    local install_path="$INSTALL_DIR/pimler"
-    local bash_completion="$COMPLETIONS_DIR_BASH/pimler"
-    local zsh_completion="$COMPLETIONS_DIR_ZSH/_pimler"
+    local install_path="$INSTALL_DIR/pim"
+    local bash_completion="$COMPLETIONS_DIR_BASH/pim"
+    local zsh_completion="$COMPLETIONS_DIR_ZSH/_pim"
 
     if [[ -e "$install_path" ]]; then
         rm -f "$install_path"
         gum style --foreground 35 "✓ Removed $install_path"
     else
-        gum style --foreground 214 "pimler not found in $INSTALL_DIR"
+        gum style --foreground 214 "pim not found in $INSTALL_DIR"
     fi
 
     if [[ -e "$bash_completion" ]]; then
@@ -1906,7 +1918,7 @@ do_uninstall() {
 
             # Also remove refresh token from secret-tool
             if command -v secret-tool &> /dev/null; then
-                secret-tool clear application pimler type refresh_token 2>/dev/null || true
+                secret-tool clear application pim type refresh_token 2>/dev/null || true
                 gum style --foreground 35 "✓ Removed stored credentials"
             fi
         fi
@@ -1926,22 +1938,22 @@ install_completions() {
     # Install bash completions
     if [[ "$current_shell" == "bash" ]] || [[ -d "$COMPLETIONS_DIR_BASH" ]] || gum confirm "Install bash completions?"; then
         mkdir -p "$COMPLETIONS_DIR_BASH"
-        generate_bash_completions > "$COMPLETIONS_DIR_BASH/pimler"
-        gum style --foreground 35 "✓ Bash completions installed to $COMPLETIONS_DIR_BASH/pimler"
+        generate_bash_completions > "$COMPLETIONS_DIR_BASH/pim"
+        gum style --foreground 35 "✓ Bash completions installed to $COMPLETIONS_DIR_BASH/pim"
     fi
 
     # Install zsh completions
     if [[ "$current_shell" == "zsh" ]] || [[ -d "$COMPLETIONS_DIR_ZSH" ]] || gum confirm "Install zsh completions?"; then
         mkdir -p "$COMPLETIONS_DIR_ZSH"
-        generate_zsh_completions > "$COMPLETIONS_DIR_ZSH/_pimler"
-        gum style --foreground 35 "✓ Zsh completions installed to $COMPLETIONS_DIR_ZSH/_pimler"
+        generate_zsh_completions > "$COMPLETIONS_DIR_ZSH/_pim"
+        gum style --foreground 35 "✓ Zsh completions installed to $COMPLETIONS_DIR_ZSH/_pim"
     fi
 
     echo ""
     gum style --foreground 214 "Restart your shell or run:"
     case "$current_shell" in
         bash)
-            echo "  source $COMPLETIONS_DIR_BASH/pimler"
+            echo "  source $COMPLETIONS_DIR_BASH/pim"
             ;;
         zsh)
             echo "  autoload -Uz compinit && compinit"
@@ -1965,7 +1977,7 @@ handle_completions() {
         *)
             gum style --bold --foreground 212 "Shell Completions"
             echo ""
-            echo "Usage: pimler completions <command>"
+            echo "Usage: pim completions <command>"
             echo ""
             echo "Commands:"
             echo "  bash     Print bash completion script"
@@ -1973,8 +1985,8 @@ handle_completions() {
             echo "  install  Install completions for your shell"
             echo ""
             echo "To manually source completions:"
-            gum style --foreground 33 "  Bash: eval \"\$(pimler completions bash)\""
-            gum style --foreground 33 "  Zsh:  eval \"\$(pimler completions zsh)\""
+            gum style --foreground 33 "  Bash: eval \"\$(pim completions bash)\""
+            gum style --foreground 33 "  Zsh:  eval \"\$(pim completions zsh)\""
             ;;
     esac
 }
@@ -2010,14 +2022,14 @@ show_help() {
     echo "    deactivate, d   Deactivate an active role"
     echo ""
     gum style --foreground 35 "  Azure AD Groups (requires setup + login):"
-    echo "    groups          List eligible PIM group memberships"
-    echo "    groups-active   List currently active PIM group memberships"
-    echo "    group-activate  Activate an eligible group membership (interactive)"
-    echo "    group-deactivate Deactivate an active group membership"
+    echo "    groups [list]      List eligible PIM group memberships"
+    echo "    groups active      List currently active PIM group memberships"
+    echo "    groups activate    Activate an eligible group membership (interactive)"
+    echo "    groups deactivate  Deactivate an active group membership"
     echo ""
     gum style --foreground 35 "  Utility:"
-    echo "    install         Install pimler to ~/.local/bin"
-    echo "    uninstall       Remove pimler and optionally config"
+    echo "    install         Install pim to ~/.local/bin"
+    echo "    uninstall       Remove pim and optionally config"
     echo "    completions     Manage shell tab completions"
     echo "    help, h         Show this help message"
     echo ""
@@ -2027,10 +2039,10 @@ show_help() {
     echo "    3. pim.sh login           # Authenticate"
     echo ""
     gum style --bold --foreground 33 "EXAMPLES:"
-    echo "    pim.sh list               # List eligible roles"
-    echo "    pim.sh activate           # Interactive role activation"
-    echo "    pim.sh groups             # List eligible PIM groups"
-    echo "    pim.sh group-activate     # Activate a PIM group membership"
+    echo "    pim list                  # List eligible roles"
+    echo "    pim activate              # Interactive role activation"
+    echo "    pim groups                # List eligible PIM groups"
+    echo "    pim groups activate       # Activate a PIM group membership"
 }
 
 #------------------------------------------------------------------------------
@@ -2074,17 +2086,28 @@ main() {
             deactivate_role "$@"
             ;;
         # Group commands (use app token, not Azure CLI)
-        groups|group-list)
-            list_eligible_groups
-            ;;
-        groups-active|group-active)
-            list_active_groups
-            ;;
-        group-activate|ga)
-            interactive_activate_group
-            ;;
-        group-deactivate|gd)
-            deactivate_group
+        groups)
+            local subcommand="${1:-list}"
+            shift || true
+            case "$subcommand" in
+                list|ls)
+                    list_eligible_groups
+                    ;;
+                active)
+                    list_active_groups
+                    ;;
+                activate|a)
+                    interactive_activate_group
+                    ;;
+                deactivate|d)
+                    deactivate_group
+                    ;;
+                *)
+                    gum style --foreground 196 "Unknown groups subcommand: $subcommand"
+                    echo "Usage: pim groups [list|active|activate|deactivate]"
+                    exit 1
+                    ;;
+            esac
             ;;
         # Installation commands
         install)

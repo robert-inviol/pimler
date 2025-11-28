@@ -1,14 +1,14 @@
-# pimler
+# pim
 
 **Stop clicking through the Azure Portal. Activate your PIM roles from the terminal like a civilized engineer.**
 
 ```
-$ pimler activate 1
+$ pim activate 1
 ✓ Role activation request submitted successfully!
 Status: Provisioned
 ```
 
-Pimler is a blazingly fast CLI for Azure Privileged Identity Management (PIM). Activate roles, manage group memberships, and get back to actual work in seconds instead of minutes.
+pim is a blazingly fast CLI for Azure Privileged Identity Management (PIM). Activate roles, manage group memberships, and get back to actual work in seconds instead of minutes.
 
 ## Why?
 
@@ -23,9 +23,9 @@ Because activating a PIM role in the Azure Portal requires:
 8. Waiting for the page to reload
 9. Wondering if it actually worked
 
-With pimler:
+With pim:
 ```
-$ pimler a 1
+$ pim a 1
 ```
 
 Done.
@@ -70,13 +70,13 @@ The installer will:
 az login
 
 # Setup creates an app registration for PIM access
-pimler setup
+pim setup
 
 # Grant admin consent (requires admin, or ask your admin)
-pimler grant-consent
+pim grant-consent
 
-# Authenticate pimler
-pimler login
+# Authenticate pim
+pim login
 ```
 
 ## Usage
@@ -85,38 +85,38 @@ pimler login
 
 ```bash
 # List your eligible roles
-pimler list
+pim list
 
 # Activate role by index
-pimler activate 1
+pim activate 1
 
 # Activate with custom duration (hours) and justification
-pimler activate 1 4 "Investigating production incident"
+pim activate 1 4 "Investigating production incident"
 
 # Interactive activation (shows a nice picker)
-pimler a
+pim a
 
 # List currently active roles
-pimler active
+pim active
 
 # Deactivate a role
-pimler deactivate
+pim deactivate
 ```
 
 ### Groups (Azure AD)
 
 ```bash
 # List eligible group memberships
-pimler groups
+pim groups
 
 # Activate group membership
-pimler ga
+pim groups activate
 
 # List active group memberships
-pimler groups-active
+pim groups active
 
 # Deactivate group membership
-pimler gd
+pim groups deactivate
 ```
 
 ### Shortcuts
@@ -126,13 +126,16 @@ pimler gd
 | `list` | `ls` | List eligible roles |
 | `activate` | `a` | Activate a role |
 | `deactivate` | `d` | Deactivate a role |
-| `group-activate` | `ga` | Activate group membership |
-| `group-deactivate` | `gd` | Deactivate group membership |
+| `groups` | | List eligible groups |
+| `groups list` | `groups ls` | List eligible groups |
+| `groups active` | | List active groups |
+| `groups activate` | `groups a` | Activate group membership |
+| `groups deactivate` | `groups d` | Deactivate group membership |
 | `help` | `h` | Show help |
 
 ## How It Works
 
-Pimler uses:
+pim uses:
 - **Azure CLI** (`az rest`) for Azure Resource Manager PIM APIs
 - **Microsoft Graph API** for Azure AD group PIM operations
 - **Device code flow** for authentication (no secrets needed)
@@ -140,14 +143,14 @@ Pimler uses:
 
 ## Configuration
 
-Config is stored in `~/.config/pimler/`:
+Config is stored in `~/.config/pim/`:
 - `app.json` - App registration details
 - `token.json` - Cached access tokens
 
 ## Uninstall
 
 ```bash
-pimler uninstall
+pim uninstall
 ```
 
 This removes the binary, completions, and optionally the config directory.
