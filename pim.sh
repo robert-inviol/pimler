@@ -30,7 +30,9 @@ GRAPH_PERMISSIONS=(
     "PrivilegedAccess.ReadWrite.AzureADGroup"
     "PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup"
     "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"
-    "RoleManagement.Read.Directory"
+    "RoleManagement.ReadWrite.Directory"
+    "RoleEligibilitySchedule.ReadWrite.Directory"
+    "RoleAssignmentSchedule.ReadWrite.Directory"
 )
 
 # Global variables for caching
@@ -838,10 +840,11 @@ list_active_roles() {
     group_ids=$(get_user_group_ids)
     subscription_id=$(get_subscription_id)
 
+    # Fetch subscription-level active roles
     local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01"
 
     local all_active
-    all_active=$(gum spin --spinner dot --title "Fetching active roles..." -- \
+    all_active=$(gum spin --spinner dot --title "Fetching subscription-level active roles..." -- \
         az rest --method GET --url "$url" 2>/dev/null) || {
         gum style --foreground 196 "Failed to fetch active assignments"
         return 1
@@ -866,28 +869,69 @@ list_active_roles() {
     local assignments
     assignments=$(echo "$all_active" | jq "$jq_filter")
 
-    local count
-    count=$(echo "$assignments" | jq 'length')
+    local sub_count
+    sub_count=$(echo "$assignments" | jq 'length')
 
-    if [[ "$count" -eq 0 ]]; then
+    # Fetch directory-level active roles
+    local dir_active dir_count=0
+    local graph_token graph_user_id
+    graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+    if [[ -n "$graph_token" ]]; then
+        graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+        if [[ -n "$graph_user_id" ]]; then
+            local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27%20and%20assignmentType%20eq%20%27Activated%27&\$expand=roleDefinition"
+
+            dir_active=$(gum spin --spinner dot --title "Fetching directory-level active roles..." -- \
+                curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_active=""
+        fi
+    fi
+
+    if [[ -n "$dir_active" ]] && ! echo "$dir_active" | jq -e '.error' &>/dev/null; then
+        dir_count=$(echo "$dir_active" | jq '.value | length // 0')
+    fi
+
+    local total_count=$((sub_count + dir_count))
+
+    if [[ "$total_count" -eq 0 ]]; then
         gum style --foreground 214 "No currently active PIM role assignments."
         return 0
     fi
 
-    gum style --foreground 252 "Found $count active role(s):"
+    gum style --foreground 252 "Found $total_count active role(s):"
     echo ""
 
-    while IFS= read -r assignment; do
-        local role_name scope_name end_time
+    # Display subscription-level roles
+    if [[ "$sub_count" -gt 0 ]]; then
+        gum style --foreground 252 --italic "  Azure Resources ($sub_count):"
+        while IFS= read -r assignment; do
+            local role_name scope_name end_time
 
-        role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
-        scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
-        end_time=$(echo "$assignment" | jq -r '.properties.endDateTime // "Permanent"')
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+            scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+            end_time=$(echo "$assignment" | jq -r '.properties.endDateTime // "Permanent"')
 
-        gum style --foreground 35 "  ● $role_name @ $scope_name"
-        gum style --foreground 245 "    Expires: $end_time"
+            gum style --foreground 35 "    ● $role_name @ $scope_name"
+            gum style --foreground 245 "      Expires: $end_time"
+        done < <(echo "$assignments" | jq -c '.[]')
+    fi
+
+    # Display directory-level roles
+    if [[ "$dir_count" -gt 0 ]]; then
         echo ""
-    done < <(echo "$assignments" | jq -c '.[]')
+        gum style --foreground 252 --italic "  Entra ID Directory Roles ($dir_count):"
+        while IFS= read -r assignment; do
+            local role_name end_time
+
+            role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+            end_time=$(echo "$assignment" | jq -r '.endDateTime // "Permanent"')
+
+            gum style --foreground 35 "    ● $role_name"
+            gum style --foreground 245 "      Expires: $end_time"
+        done < <(echo "$dir_active" | jq -c '.value[]')
+    fi
+    echo ""
 }
 
 activate_role() {
@@ -969,6 +1013,76 @@ activate_role() {
     fi
 }
 
+activate_directory_role() {
+    local assignment="$1"
+    local duration_hours="${2:-$DEFAULT_DURATION_HOURS}"
+    local justification="${3:-Activated via PIM CLI tool}"
+
+    local graph_token
+    graph_token=$(get_graph_token) || {
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
+        return 1
+    }
+
+    local role_def_id principal_id role_name dir_scope_id
+    role_def_id=$(echo "$assignment" | jq -r '.roleDefinition.id // .roleDefinitionId')
+    principal_id=$(echo "$assignment" | jq -r '.principalId')
+    role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+    dir_scope_id=$(echo "$assignment" | jq -r '.directoryScopeId // "/"')
+
+    local request_body
+    request_body=$(jq -n \
+        --arg principalId "$principal_id" \
+        --arg roleDefinitionId "$role_def_id" \
+        --arg directoryScopeId "$dir_scope_id" \
+        --arg justification "$justification" \
+        --arg duration "PT${duration_hours}H" \
+        '{
+            action: "selfActivate",
+            principalId: $principalId,
+            roleDefinitionId: $roleDefinitionId,
+            directoryScopeId: $directoryScopeId,
+            justification: $justification,
+            scheduleInfo: {
+                expiration: {
+                    type: "AfterDuration",
+                    duration: $duration
+                }
+            }
+        }')
+
+    local result
+    result=$(gum spin --spinner dot --title "Activating $role_name..." -- \
+        curl -s -X POST \
+        -H "Authorization: Bearer $graph_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests") || {
+        gum style --foreground 196 "Failed to activate directory role"
+        return 1
+    }
+
+    if echo "$result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+        gum style --foreground 196 "Failed to activate role: $error_msg"
+        return 1
+    fi
+
+    local status
+    status=$(echo "$result" | jq -r '.status // "Unknown"')
+
+    if [[ "$status" == "Provisioned" ]] || [[ "$status" == "PendingApproval" ]] || [[ "$status" == "Granted" ]]; then
+        gum style --foreground 35 --bold "✓ Role activation request submitted successfully!"
+        gum style --foreground 33 "Status: $status"
+        if [[ "$status" == "PendingApproval" ]]; then
+            gum style --foreground 214 "This role requires approval. Please wait for an approver to approve your request."
+        fi
+    else
+        gum style --foreground 214 "Activation request status: $status"
+    fi
+}
+
 interactive_activate() {
     gum style --bold --foreground 212 "PIM Role Activation"
     echo ""
@@ -981,10 +1095,11 @@ interactive_activate() {
     group_ids=$(get_user_group_ids)
     subscription_id=$(get_subscription_id)
 
+    # Fetch subscription-level eligible roles
     local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01"
 
     local all_assignments
-    all_assignments=$(gum spin --spinner dot --title "Fetching eligible roles..." -- \
+    all_assignments=$(gum spin --spinner dot --title "Fetching subscription-level eligible roles..." -- \
         az rest --method GET --url "$url" 2>/dev/null) || {
         gum style --foreground 196 "Failed to fetch eligible assignments"
         return 1
@@ -1009,26 +1124,69 @@ interactive_activate() {
     local assignments
     assignments=$(echo "$all_assignments" | jq "$jq_filter")
 
-    local count
-    count=$(echo "$assignments" | jq 'length')
+    local sub_count
+    sub_count=$(echo "$assignments" | jq 'length')
 
-    if [[ "$count" -eq 0 ]]; then
+    # Fetch directory-level eligible roles
+    local dir_assignments dir_count=0
+    local graph_token graph_user_id
+    graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+    if [[ -n "$graph_token" ]]; then
+        graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+        if [[ -n "$graph_user_id" ]]; then
+            local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27&\$expand=roleDefinition"
+
+            dir_assignments=$(gum spin --spinner dot --title "Fetching directory-level eligible roles..." -- \
+                curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_assignments=""
+        fi
+    fi
+
+    if [[ -n "$dir_assignments" ]] && ! echo "$dir_assignments" | jq -e '.error' &>/dev/null; then
+        dir_count=$(echo "$dir_assignments" | jq '.value | length // 0')
+    fi
+
+    local total_count=$((sub_count + dir_count))
+
+    if [[ "$total_count" -eq 0 ]]; then
         gum style --foreground 214 "No eligible role assignments found."
         return 0
     fi
 
     # Build options array for gum choose
+    # Track which assignments are directory roles
     local options=()
+    local assignment_types=()
+    local assignment_data=()
     local i=0
+
+    # Add subscription-level roles
     while IFS= read -r assignment; do
         local role_name scope_name
 
         role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
         scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
 
-        options+=("$((i + 1)). $role_name @ $scope_name")
+        options+=("$((i + 1)). [Azure] $role_name @ $scope_name")
+        assignment_types+=("azure")
+        assignment_data+=("$assignment")
         i=$((i + 1))
     done < <(echo "$assignments" | jq -c '.[]')
+
+    # Add directory-level roles
+    if [[ "$dir_count" -gt 0 ]]; then
+        while IFS= read -r assignment; do
+            local role_name
+
+            role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+
+            options+=("$((i + 1)). [Entra ID] $role_name")
+            assignment_types+=("directory")
+            assignment_data+=("$assignment")
+            i=$((i + 1))
+        done < <(echo "$dir_assignments" | jq -c '.value[]')
+    fi
 
     # Use gum choose for selection
     local selection
@@ -1042,6 +1200,7 @@ interactive_activate() {
     # Extract the index from selection
     local role_index
     role_index=$(echo "$selection" | cut -d'.' -f1)
+    local arr_index=$((role_index - 1))
 
     # Get duration using gum input
     local duration
@@ -1066,8 +1225,69 @@ interactive_activate() {
     fi
 
     echo ""
-    ELIGIBLE_ASSIGNMENTS="$assignments"
-    activate_role "$role_index" "$duration" "$justification"
+
+    # Activate based on assignment type
+    if [[ "${assignment_types[$arr_index]}" == "directory" ]]; then
+        activate_directory_role "${assignment_data[$arr_index]}" "$duration" "$justification"
+    else
+        ELIGIBLE_ASSIGNMENTS="$assignments"
+        # Calculate the azure-only index
+        local azure_index=0
+        for ((j=0; j<arr_index; j++)); do
+            if [[ "${assignment_types[$j]}" == "azure" ]]; then
+                azure_index=$((azure_index + 1))
+            fi
+        done
+        activate_role "$((azure_index + 1))" "$duration" "$justification"
+    fi
+}
+
+deactivate_directory_role() {
+    local assignment="$1"
+
+    local graph_token
+    graph_token=$(get_graph_token) || {
+        gum style --foreground 196 "Not logged in. Please run 'pim login' first."
+        return 1
+    }
+
+    local role_def_id principal_id role_name dir_scope_id
+    role_def_id=$(echo "$assignment" | jq -r '.roleDefinition.id // .roleDefinitionId')
+    principal_id=$(echo "$assignment" | jq -r '.principalId')
+    role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+    dir_scope_id=$(echo "$assignment" | jq -r '.directoryScopeId // "/"')
+
+    local request_body
+    request_body=$(jq -n \
+        --arg principalId "$principal_id" \
+        --arg roleDefinitionId "$role_def_id" \
+        --arg directoryScopeId "$dir_scope_id" \
+        '{
+            action: "selfDeactivate",
+            principalId: $principalId,
+            roleDefinitionId: $roleDefinitionId,
+            directoryScopeId: $directoryScopeId
+        }')
+
+    local result
+    result=$(gum spin --spinner dot --title "Deactivating $role_name..." -- \
+        curl -s -X POST \
+        -H "Authorization: Bearer $graph_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests") || {
+        gum style --foreground 196 "Failed to deactivate directory role"
+        return 1
+    }
+
+    if echo "$result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+        gum style --foreground 196 "Failed to deactivate role: $error_msg"
+        return 1
+    fi
+
+    gum style --foreground 35 --bold "✓ Role deactivated successfully!"
 }
 
 deactivate_role() {
@@ -1082,10 +1302,11 @@ deactivate_role() {
     group_ids=$(get_user_group_ids)
     subscription_id=$(get_subscription_id)
 
+    # Fetch subscription-level active roles
     local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01"
 
     local all_active
-    all_active=$(gum spin --spinner dot --title "Fetching active roles..." -- \
+    all_active=$(gum spin --spinner dot --title "Fetching subscription-level active roles..." -- \
         az rest --method GET --url "$url" 2>/dev/null) || {
         gum style --foreground 196 "Failed to fetch active assignments"
         return 1
@@ -1110,26 +1331,68 @@ deactivate_role() {
     local active
     active=$(echo "$all_active" | jq "$jq_filter")
 
-    local count
-    count=$(echo "$active" | jq 'length')
+    local sub_count
+    sub_count=$(echo "$active" | jq 'length')
 
-    if [[ "$count" -eq 0 ]]; then
+    # Fetch directory-level active roles
+    local dir_active dir_count=0
+    local graph_token graph_user_id
+    graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+    if [[ -n "$graph_token" ]]; then
+        graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+        if [[ -n "$graph_user_id" ]]; then
+            local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27%20and%20assignmentType%20eq%20%27Activated%27&\$expand=roleDefinition"
+
+            dir_active=$(gum spin --spinner dot --title "Fetching directory-level active roles..." -- \
+                curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_active=""
+        fi
+    fi
+
+    if [[ -n "$dir_active" ]] && ! echo "$dir_active" | jq -e '.error' &>/dev/null; then
+        dir_count=$(echo "$dir_active" | jq '.value | length // 0')
+    fi
+
+    local total_count=$((sub_count + dir_count))
+
+    if [[ "$total_count" -eq 0 ]]; then
         gum style --foreground 214 "No active role assignments to deactivate."
         return 0
     fi
 
     # Build options array for gum choose
     local options=()
+    local assignment_types=()
+    local assignment_data=()
     local i=0
+
+    # Add subscription-level roles
     while IFS= read -r assignment; do
         local role_name scope_name
 
         role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
         scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
 
-        options+=("$((i + 1)). $role_name @ $scope_name")
+        options+=("$((i + 1)). [Azure] $role_name @ $scope_name")
+        assignment_types+=("azure")
+        assignment_data+=("$assignment")
         i=$((i + 1))
     done < <(echo "$active" | jq -c '.[]')
+
+    # Add directory-level roles
+    if [[ "$dir_count" -gt 0 ]]; then
+        while IFS= read -r assignment; do
+            local role_name
+
+            role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+
+            options+=("$((i + 1)). [Entra ID] $role_name")
+            assignment_types+=("directory")
+            assignment_data+=("$assignment")
+            i=$((i + 1))
+        done < <(echo "$dir_active" | jq -c '.value[]')
+    fi
 
     # Use gum choose for selection
     local selection
@@ -1143,43 +1406,48 @@ deactivate_role() {
     # Extract the index from selection
     local sel_index
     sel_index=$(echo "$selection" | cut -d'.' -f1)
+    local arr_index=$((sel_index - 1))
 
-    local selected_assignment
-    selected_assignment=$(echo "$active" | jq -c ".[$((sel_index - 1))]")
+    # Deactivate based on assignment type
+    if [[ "${assignment_types[$arr_index]}" == "directory" ]]; then
+        deactivate_directory_role "${assignment_data[$arr_index]}"
+    else
+        local selected_assignment="${assignment_data[$arr_index]}"
 
-    local role_def_id scope principal_id role_name
+        local role_def_id scope principal_id role_name
 
-    role_def_id=$(echo "$selected_assignment" | jq -r '.properties.roleDefinitionId')
-    scope=$(echo "$selected_assignment" | jq -r '.properties.scope')
-    principal_id=$(echo "$selected_assignment" | jq -r '.properties.principalId')
-    role_name=$(echo "$selected_assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+        role_def_id=$(echo "$selected_assignment" | jq -r '.properties.roleDefinitionId')
+        scope=$(echo "$selected_assignment" | jq -r '.properties.scope')
+        principal_id=$(echo "$selected_assignment" | jq -r '.properties.principalId')
+        role_name=$(echo "$selected_assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
 
-    local request_guid
-    request_guid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+        local request_guid
+        request_guid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
 
-    local request_body
-    request_body=$(jq -n \
-        --arg principalId "$principal_id" \
-        --arg roleDefinitionId "$role_def_id" \
-        '{
-            properties: {
-                principalId: $principalId,
-                roleDefinitionId: $roleDefinitionId,
-                requestType: "SelfDeactivate"
-            }
-        }')
+        local request_body
+        request_body=$(jq -n \
+            --arg principalId "$principal_id" \
+            --arg roleDefinitionId "$role_def_id" \
+            '{
+                properties: {
+                    principalId: $principalId,
+                    roleDefinitionId: $roleDefinitionId,
+                    requestType: "SelfDeactivate"
+                }
+            }')
 
-    local api_url="https://management.azure.com${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${request_guid}?api-version=2020-10-01"
+        local api_url="https://management.azure.com${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${request_guid}?api-version=2020-10-01"
 
-    local result
-    result=$(gum spin --spinner dot --title "Deactivating $role_name..." -- \
-        az rest --method PUT --url "$api_url" --headers "Content-Type=application/json" --body "$request_body" 2>&1) || {
-        gum style --foreground 196 "Failed to deactivate role"
-        echo "$result"
-        return 1
-    }
+        local result
+        result=$(gum spin --spinner dot --title "Deactivating $role_name..." -- \
+            az rest --method PUT --url "$api_url" --headers "Content-Type=application/json" --body "$request_body" 2>&1) || {
+            gum style --foreground 196 "Failed to deactivate role"
+            echo "$result"
+            return 1
+        }
 
-    gum style --foreground 35 --bold "✓ Role deactivated successfully!"
+        gum style --foreground 35 --bold "✓ Role deactivated successfully!"
+    fi
 }
 
 #------------------------------------------------------------------------------
