@@ -23,13 +23,14 @@ APP_CONFIG_FILE="$CONFIG_DIR/app.json"
 TOKEN_CACHE_FILE="$CONFIG_DIR/token.json"
 APP_NAME="PIM CLI Tool"
 
-# Required Graph API permissions for PIM groups
+# Required Graph API permissions for PIM groups and directory roles
 GRAPH_PERMISSIONS=(
     "User.Read"
     "Group.Read.All"
     "PrivilegedAccess.ReadWrite.AzureADGroup"
     "PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup"
     "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"
+    "RoleManagement.Read.Directory"
 )
 
 # Global variables for caching
@@ -643,6 +644,15 @@ get_all_eligible_assignments() {
         2>/dev/null
 }
 
+get_directory_eligible_assignments() {
+    local user_id
+    user_id=$(get_graph_user_id) || return 1
+
+    local url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27&\$expand=roleDefinition"
+
+    graph_request GET "$url"
+}
+
 get_user_eligible_assignments() {
     local user_id
     local group_ids
@@ -725,12 +735,13 @@ list_eligible_roles() {
     group_ids=$(get_user_group_ids)
     subscription_id=$(get_subscription_id)
 
+    # Fetch subscription-level assignments
     local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01"
 
     local all_assignments
-    all_assignments=$(gum spin --spinner dot --title "Fetching eligible roles..." -- \
+    all_assignments=$(gum spin --spinner dot --title "Fetching subscription-level eligible roles..." -- \
         az rest --method GET --url "$url" 2>/dev/null) || {
-        gum style --foreground 196 "Failed to fetch eligible assignments"
+        gum style --foreground 196 "Failed to fetch subscription-level eligible assignments"
         return 1
     }
 
@@ -753,25 +764,64 @@ list_eligible_roles() {
     local assignments
     assignments=$(echo "$all_assignments" | jq "$jq_filter")
 
-    local count
-    count=$(echo "$assignments" | jq 'length')
+    local sub_count
+    sub_count=$(echo "$assignments" | jq 'length')
 
-    if [[ "$count" -eq 0 ]]; then
+    # Fetch directory-level assignments
+    local dir_assignments dir_count=0
+    local graph_token graph_user_id
+    graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+    if [[ -n "$graph_token" ]]; then
+        graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+        if [[ -n "$graph_user_id" ]]; then
+            local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27&\$expand=roleDefinition"
+
+            dir_assignments=$(gum spin --spinner dot --title "Fetching directory-level eligible roles..." -- \
+                curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_assignments=""
+        fi
+    fi
+
+    if [[ -n "$dir_assignments" ]] && ! echo "$dir_assignments" | jq -e '.error' &>/dev/null; then
+        dir_count=$(echo "$dir_assignments" | jq '.value | length // 0')
+    fi
+
+    local total_count=$((sub_count + dir_count))
+
+    if [[ "$total_count" -eq 0 ]]; then
         gum style --foreground 214 "No eligible role assignments found for your account."
         return 0
     fi
 
-    gum style --foreground 252 "Found $count eligible role(s):"
+    gum style --foreground 252 "Found $total_count eligible role(s):"
     echo ""
 
-    while IFS= read -r assignment; do
-        local role_name scope_name
+    # Display subscription-level roles
+    if [[ "$sub_count" -gt 0 ]]; then
+        gum style --foreground 252 --italic "  Azure Resources ($sub_count):"
+        while IFS= read -r assignment; do
+            local role_name scope_name
 
-        role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
-        scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+            scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
 
-        gum style --foreground 35 "  • $role_name @ $scope_name"
-    done < <(echo "$assignments" | jq -c '.[]')
+            gum style --foreground 35 "    • $role_name @ $scope_name"
+        done < <(echo "$assignments" | jq -c '.[]')
+    fi
+
+    # Display directory-level roles
+    if [[ "$dir_count" -gt 0 ]]; then
+        echo ""
+        gum style --foreground 252 --italic "  Entra ID Directory Roles ($dir_count):"
+        while IFS= read -r assignment; do
+            local role_name
+
+            role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+
+            gum style --foreground 35 "    • $role_name"
+        done < <(echo "$dir_assignments" | jq -c '.value[]')
+    fi
 
     ELIGIBLE_ASSIGNMENTS="$assignments"
 }

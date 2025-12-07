@@ -3,7 +3,14 @@
 **Stop clicking through the Azure Portal. Activate your PIM roles from the terminal like a civilized engineer.**
 
 ```
-$ pim activate 1
+$ pim activate
+? Select role to activate:
+> 1. Contributor @ my-subscription
+  2. Reader @ my-resource-group
+
+? Duration in hours (1-8): 1
+? Justification: Deploying hotfix
+
 ✓ Role activation request submitted successfully!
 Status: Provisioned
 ```
@@ -25,7 +32,7 @@ Because activating a PIM role in the Azure Portal requires:
 
 With pim:
 ```
-$ pim a 1
+$ pim a
 ```
 
 Done.
@@ -34,7 +41,7 @@ Done.
 
 - **Role Management** - List, activate, and deactivate Azure resource roles
 - **Group Management** - Manage PIM-enabled group memberships
-- **Interactive Mode** - Beautiful TUI with fuzzy selection when you forget the index
+- **Interactive Mode** - Beautiful TUI powered by [gum](https://github.com/charmbracelet/gum)
 - **Fast** - Batch API calls, token caching, minimal overhead
 - **Secure** - No secrets stored, uses device code auth, tokens in system keyring
 
@@ -87,19 +94,13 @@ pim login
 # List your eligible roles
 pim list
 
-# Activate role by index
-pim activate 1
-
-# Activate with custom duration (hours) and justification
-pim activate 1 4 "Investigating production incident"
-
-# Interactive activation (shows a nice picker)
-pim a
+# Activate a role (interactive - select role, duration, justification)
+pim activate
 
 # List currently active roles
 pim active
 
-# Deactivate a role
+# Deactivate a role (interactive)
 pim deactivate
 ```
 
@@ -109,25 +110,25 @@ pim deactivate
 # List eligible group memberships
 pim groups
 
-# Activate group membership
+# Activate group membership (interactive)
 pim groups activate
 
 # List active group memberships
 pim groups active
 
-# Deactivate group membership
+# Deactivate group membership (interactive)
 pim groups deactivate
 ```
 
-### Shortcuts
+### Command Reference
 
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `list` | `ls` | List eligible roles |
-| `activate` | `a` | Activate a role |
-| `deactivate` | `d` | Deactivate a role |
+| `activate` | `a` | Activate a role (interactive) |
+| `active` | | List active roles |
+| `deactivate` | `d` | Deactivate a role (interactive) |
 | `groups` | | List eligible groups |
-| `groups list` | `groups ls` | List eligible groups |
 | `groups active` | | List active groups |
 | `groups activate` | `groups a` | Activate group membership |
 | `groups deactivate` | `groups d` | Deactivate group membership |
