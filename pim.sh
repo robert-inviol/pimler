@@ -2018,25 +2018,27 @@ generate_bash_completions() {
     cat << 'BASH_COMPLETIONS'
 # pim bash completion
 _pim() {
-    local cur prev commands
+    local cur prev commands scopes shorthand
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="setup grant-consent login list ls active activate a deactivate d groups help h install uninstall completions"
+    commands="list l active activate a deactivate d setup grant-consent login help h install uninstall completions"
+    scopes="all tenant t role r group g"
+    shorthand="lt lr lg la lat lar lag at ar ag dt dr dg"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${commands} ${shorthand}" -- "${cur}") )
         return 0
     fi
 
     case "${prev}" in
-        completions)
-            COMPREPLY=( $(compgen -W "bash zsh install" -- "${cur}") )
+        list|l|active|activate|a|deactivate|d)
+            COMPREPLY=( $(compgen -W "${scopes}" -- "${cur}") )
             return 0
             ;;
-        groups)
-            COMPREPLY=( $(compgen -W "list ls active activate a deactivate d" -- "${cur}") )
+        completions)
+            COMPREPLY=( $(compgen -W "bash zsh install" -- "${cur}") )
             return 0
             ;;
     esac
@@ -2054,34 +2056,46 @@ generate_zsh_completions() {
 #compdef pim pim.sh
 
 _pim() {
-    local -a commands groups_commands
+    local -a commands scopes
     commands=(
-        'setup:Create app registration for PIM group permissions'
+        'list:List eligible assignments'
+        'l:List eligible assignments'
+        'active:List active assignments'
+        'activate:Activate an eligible assignment'
+        'a:Activate an eligible assignment'
+        'deactivate:Deactivate an active assignment'
+        'd:Deactivate an active assignment'
+        'setup:Create app registration for PIM permissions'
         'grant-consent:Grant admin consent for the app (requires admin)'
-        'login:Authenticate with PIM group permissions'
-        'list:List eligible role assignments'
-        'ls:List eligible role assignments'
-        'active:List currently active role assignments'
-        'activate:Activate an eligible role (interactive)'
-        'a:Activate an eligible role (interactive)'
-        'deactivate:Deactivate an active role'
-        'd:Deactivate an active role'
-        'groups:Manage PIM group memberships'
+        'login:Authenticate with PIM permissions'
         'help:Show help message'
         'h:Show help message'
         'install:Install pim to ~/.local/bin'
         'uninstall:Remove pim from ~/.local/bin'
         'completions:Manage shell completions'
+        'lt:List eligible tenant roles'
+        'lr:List eligible Azure roles'
+        'lg:List eligible PIM groups'
+        'la:List active (all)'
+        'lat:List active tenant roles'
+        'lar:List active Azure roles'
+        'lag:List active PIM groups'
+        'at:Activate tenant role'
+        'ar:Activate Azure role'
+        'ag:Activate group membership'
+        'dt:Deactivate tenant role'
+        'dr:Deactivate Azure role'
+        'dg:Deactivate group membership'
     )
 
-    groups_commands=(
-        'list:List eligible PIM group memberships'
-        'ls:List eligible PIM group memberships'
-        'active:List currently active PIM group memberships'
-        'activate:Activate an eligible group membership'
-        'a:Activate an eligible group membership'
-        'deactivate:Deactivate an active group membership'
-        'd:Deactivate an active group membership'
+    scopes=(
+        'all:All types (tenant, role, group)'
+        'tenant:Entra ID directory roles'
+        't:Entra ID directory roles'
+        'role:Azure subscription roles'
+        'r:Azure subscription roles'
+        'group:PIM groups'
+        'g:PIM groups'
     )
 
     _arguments -C \
@@ -2094,11 +2108,11 @@ _pim() {
             ;;
         args)
             case $words[2] in
+                list|l|active|activate|a|deactivate|d)
+                    _describe -t scopes 'scope' scopes
+                    ;;
                 completions)
                     _values 'completion commands' 'bash[Show bash completions]' 'zsh[Show zsh completions]' 'install[Install completions]'
-                    ;;
-                groups)
-                    _describe -t commands 'groups subcommands' groups_commands
                     ;;
             esac
             ;;
@@ -2310,6 +2324,851 @@ handle_completions() {
 }
 
 #------------------------------------------------------------------------------
+# Unified Action Functions (with scope support)
+#------------------------------------------------------------------------------
+
+do_list() {
+    local scope="$1"
+
+    gum style --bold --foreground 212 "Eligible Assignments"
+    echo ""
+
+    local has_results=false
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local graph_token graph_user_id dir_assignments dir_count=0
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+            if [[ -n "$graph_user_id" ]]; then
+                local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27&\$expand=roleDefinition"
+
+                dir_assignments=$(gum spin --spinner dot --title "Fetching Entra ID roles..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_assignments=""
+
+                if [[ -n "$dir_assignments" ]] && ! echo "$dir_assignments" | jq -e '.error' &>/dev/null; then
+                    dir_count=$(echo "$dir_assignments" | jq '.value | length // 0')
+                fi
+
+                if [[ "$dir_count" -gt 0 ]]; then
+                    has_results=true
+                    gum style --foreground 252 --italic "  Entra ID Tenant Roles ($dir_count):"
+                    while IFS= read -r assignment; do
+                        local role_name
+                        role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                        gum style --foreground 35 "    • $role_name"
+                    done < <(echo "$dir_assignments" | jq -c '.value[]')
+                    echo ""
+                fi
+            fi
+        elif [[ "$scope" == "tenant" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Role (Azure subscription roles)
+    if [[ "$scope" == "all" || "$scope" == "role" ]]; then
+        check_az
+        check_login
+
+        local user_id group_ids subscription_id
+        user_id=$(get_current_user_id)
+        group_ids=$(get_user_group_ids)
+        subscription_id=$(get_subscription_id)
+
+        local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01"
+
+        local all_assignments
+        all_assignments=$(gum spin --spinner dot --title "Fetching Azure roles..." -- \
+            az rest --method GET --url "$url" 2>/dev/null) || {
+            gum style --foreground 196 "Failed to fetch Azure role assignments"
+            return 1
+        }
+
+        local principal_ids="$user_id $group_ids"
+        local jq_filter='[.value[] | select('
+        local first=true
+        for pid in $principal_ids; do
+            if [[ -n "$pid" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    jq_filter+=".properties.principalId == \"$pid\""
+                    first=false
+                else
+                    jq_filter+=" or .properties.principalId == \"$pid\""
+                fi
+            fi
+        done
+        jq_filter+=')]'
+
+        local assignments
+        assignments=$(echo "$all_assignments" | jq "$jq_filter")
+        local sub_count
+        sub_count=$(echo "$assignments" | jq 'length')
+
+        if [[ "$sub_count" -gt 0 ]]; then
+            has_results=true
+            gum style --foreground 252 --italic "  Azure Subscription Roles ($sub_count):"
+            while IFS= read -r assignment; do
+                local role_name scope_name
+                role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+                scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+                gum style --foreground 35 "    • $role_name @ $scope_name"
+            done < <(echo "$assignments" | jq -c '.[]')
+            echo ""
+        fi
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local graph_token user_id
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            user_id=$(get_graph_user_id 2>/dev/null) || user_id=""
+
+            if [[ -n "$user_id" ]]; then
+                local group_url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27"
+
+                local group_result
+                group_result=$(gum spin --spinner dot --title "Fetching PIM groups..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$group_url") || group_result=""
+
+                if [[ -n "$group_result" ]] && ! echo "$group_result" | jq -e '.error' &>/dev/null; then
+                    local group_count
+                    group_count=$(echo "$group_result" | jq '.value | length // 0')
+
+                    if [[ "$group_count" -gt 0 ]]; then
+                        has_results=true
+                        # Get group names
+                        local group_ids_list
+                        group_ids_list=$(echo "$group_result" | jq -r '.value[].groupId' | sort -u)
+
+                        gum style --foreground 252 --italic "  PIM Groups ($group_count):"
+                        while IFS= read -r item; do
+                            local group_id access_id group_name
+                            group_id=$(echo "$item" | jq -r '.groupId')
+                            access_id=$(echo "$item" | jq -r '.accessId')
+
+                            # Fetch group name
+                            group_name=$(curl -s -X GET \
+                                -H "Authorization: Bearer $graph_token" \
+                                -H "Content-Type: application/json" \
+                                "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+                            gum style --foreground 35 "    • $group_name ($access_id)"
+                        done < <(echo "$group_result" | jq -c '.value[]')
+                        echo ""
+                    fi
+                fi
+            fi
+        elif [[ "$scope" == "group" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    if [[ "$has_results" == "false" ]]; then
+        gum style --foreground 214 "No eligible assignments found."
+    fi
+}
+
+do_list_active() {
+    local scope="$1"
+
+    gum style --bold --foreground 212 "Active Assignments"
+    echo ""
+
+    local has_results=false
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local graph_token graph_user_id dir_active dir_count=0
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+            if [[ -n "$graph_user_id" ]]; then
+                local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27%20and%20assignmentType%20eq%20%27Activated%27&\$expand=roleDefinition"
+
+                dir_active=$(gum spin --spinner dot --title "Fetching active Entra ID roles..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_active=""
+
+                if [[ -n "$dir_active" ]] && ! echo "$dir_active" | jq -e '.error' &>/dev/null; then
+                    dir_count=$(echo "$dir_active" | jq '.value | length // 0')
+                fi
+
+                if [[ "$dir_count" -gt 0 ]]; then
+                    has_results=true
+                    gum style --foreground 252 --italic "  Entra ID Tenant Roles ($dir_count):"
+                    while IFS= read -r assignment; do
+                        local role_name end_time
+                        role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                        end_time=$(echo "$assignment" | jq -r '.endDateTime // "Permanent"')
+                        gum style --foreground 35 "    • $role_name"
+                        gum style --foreground 245 "      Expires: $end_time"
+                    done < <(echo "$dir_active" | jq -c '.value[]')
+                    echo ""
+                fi
+            fi
+        elif [[ "$scope" == "tenant" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Role (Azure subscription roles)
+    if [[ "$scope" == "all" || "$scope" == "role" ]]; then
+        check_az
+        check_login
+
+        local user_id group_ids subscription_id
+        user_id=$(get_current_user_id)
+        group_ids=$(get_user_group_ids)
+        subscription_id=$(get_subscription_id)
+
+        local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01"
+
+        local all_active
+        all_active=$(gum spin --spinner dot --title "Fetching active Azure roles..." -- \
+            az rest --method GET --url "$url" 2>/dev/null) || {
+            gum style --foreground 196 "Failed to fetch active Azure role assignments"
+            return 1
+        }
+
+        local principal_ids="$user_id $group_ids"
+        local jq_filter='[.value[] | select((.properties.assignmentType == "Activated") and ('
+        local first=true
+        for pid in $principal_ids; do
+            if [[ -n "$pid" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    jq_filter+=".properties.principalId == \"$pid\""
+                    first=false
+                else
+                    jq_filter+=" or .properties.principalId == \"$pid\""
+                fi
+            fi
+        done
+        jq_filter+='))]'
+
+        local active
+        active=$(echo "$all_active" | jq "$jq_filter")
+        local sub_count
+        sub_count=$(echo "$active" | jq 'length')
+
+        if [[ "$sub_count" -gt 0 ]]; then
+            has_results=true
+            gum style --foreground 252 --italic "  Azure Subscription Roles ($sub_count):"
+            while IFS= read -r assignment; do
+                local role_name scope_name end_time
+                role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+                scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+                end_time=$(echo "$assignment" | jq -r '.properties.endDateTime // "Permanent"')
+                gum style --foreground 35 "    • $role_name @ $scope_name"
+                gum style --foreground 245 "      Expires: $end_time"
+            done < <(echo "$active" | jq -c '.[]')
+            echo ""
+        fi
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local graph_token user_id
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            user_id=$(get_graph_user_id 2>/dev/null) || user_id=""
+
+            if [[ -n "$user_id" ]]; then
+                local group_url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27"
+
+                local group_result
+                group_result=$(gum spin --spinner dot --title "Fetching active PIM groups..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$group_url") || group_result=""
+
+                if [[ -n "$group_result" ]] && ! echo "$group_result" | jq -e '.error' &>/dev/null; then
+                    local group_count
+                    group_count=$(echo "$group_result" | jq '.value | length // 0')
+
+                    if [[ "$group_count" -gt 0 ]]; then
+                        has_results=true
+
+                        gum style --foreground 252 --italic "  PIM Groups ($group_count):"
+                        while IFS= read -r item; do
+                            local group_id access_id group_name end_time
+                            group_id=$(echo "$item" | jq -r '.groupId')
+                            access_id=$(echo "$item" | jq -r '.accessId')
+                            end_time=$(echo "$item" | jq -r '.endDateTime // "Permanent"')
+
+                            # Fetch group name
+                            group_name=$(curl -s -X GET \
+                                -H "Authorization: Bearer $graph_token" \
+                                -H "Content-Type: application/json" \
+                                "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+                            gum style --foreground 35 "    • $group_name ($access_id)"
+                            gum style --foreground 245 "      Expires: $end_time"
+                        done < <(echo "$group_result" | jq -c '.value[]')
+                        echo ""
+                    fi
+                fi
+            fi
+        elif [[ "$scope" == "group" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    if [[ "$has_results" == "false" ]]; then
+        gum style --foreground 214 "No active assignments found."
+    fi
+}
+
+do_activate() {
+    local scope="$1"
+
+    gum style --bold --foreground 212 "Activate Assignment"
+    echo ""
+
+    # Collect all eligible assignments based on scope
+    local options=()
+    local assignment_types=()
+    local assignment_data=()
+    local i=0
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local graph_token graph_user_id dir_assignments
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+            if [[ -n "$graph_user_id" ]]; then
+                local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27&\$expand=roleDefinition"
+
+                dir_assignments=$(gum spin --spinner dot --title "Fetching Entra ID roles..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_assignments=""
+
+                if [[ -n "$dir_assignments" ]] && ! echo "$dir_assignments" | jq -e '.error' &>/dev/null; then
+                    while IFS= read -r assignment; do
+                        local role_name
+                        role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                        options+=("$((i + 1)). [Tenant] $role_name")
+                        assignment_types+=("tenant")
+                        assignment_data+=("$assignment")
+                        i=$((i + 1))
+                    done < <(echo "$dir_assignments" | jq -c '.value[]')
+                fi
+            fi
+        elif [[ "$scope" == "tenant" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Role (Azure subscription roles)
+    if [[ "$scope" == "all" || "$scope" == "role" ]]; then
+        check_az
+        check_login
+
+        local user_id group_ids subscription_id
+        user_id=$(get_current_user_id)
+        group_ids=$(get_user_group_ids)
+        subscription_id=$(get_subscription_id)
+
+        local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01"
+
+        local all_assignments
+        all_assignments=$(gum spin --spinner dot --title "Fetching Azure roles..." -- \
+            az rest --method GET --url "$url" 2>/dev/null) || {
+            gum style --foreground 196 "Failed to fetch Azure role assignments"
+            return 1
+        }
+
+        local principal_ids="$user_id $group_ids"
+        local jq_filter='[.value[] | select('
+        local first=true
+        for pid in $principal_ids; do
+            if [[ -n "$pid" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    jq_filter+=".properties.principalId == \"$pid\""
+                    first=false
+                else
+                    jq_filter+=" or .properties.principalId == \"$pid\""
+                fi
+            fi
+        done
+        jq_filter+=')]'
+
+        local assignments
+        assignments=$(echo "$all_assignments" | jq "$jq_filter")
+
+        while IFS= read -r assignment; do
+            local role_name scope_name
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+            scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+            options+=("$((i + 1)). [Role] $role_name @ $scope_name")
+            assignment_types+=("role")
+            assignment_data+=("$assignment")
+            i=$((i + 1))
+        done < <(echo "$assignments" | jq -c '.[]')
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local graph_token user_id
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            user_id=$(get_graph_user_id 2>/dev/null) || user_id=""
+
+            if [[ -n "$user_id" ]]; then
+                local group_url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27"
+
+                local group_result
+                group_result=$(gum spin --spinner dot --title "Fetching PIM groups..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$group_url") || group_result=""
+
+                if [[ -n "$group_result" ]] && ! echo "$group_result" | jq -e '.error' &>/dev/null; then
+                    while IFS= read -r item; do
+                        local group_id access_id group_name
+                        group_id=$(echo "$item" | jq -r '.groupId')
+                        access_id=$(echo "$item" | jq -r '.accessId')
+
+                        group_name=$(curl -s -X GET \
+                            -H "Authorization: Bearer $graph_token" \
+                            -H "Content-Type: application/json" \
+                            "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+                        options+=("$((i + 1)). [Group] $group_name ($access_id)")
+                        assignment_types+=("group")
+                        assignment_data+=("$item")
+                        i=$((i + 1))
+                    done < <(echo "$group_result" | jq -c '.value[]')
+                fi
+            fi
+        elif [[ "$scope" == "group" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        gum style --foreground 214 "No eligible assignments found."
+        return 0
+    fi
+
+    # Use gum choose for selection
+    local selection
+    selection=$(printf '%s\n' "${options[@]}" | gum choose --header "Select assignment to activate:")
+
+    if [[ -z "$selection" ]]; then
+        gum style --foreground 214 "Cancelled."
+        return 0
+    fi
+
+    local sel_index
+    sel_index=$(echo "$selection" | cut -d'.' -f1)
+    local arr_index=$((sel_index - 1))
+
+    # Get duration
+    local duration
+    duration=$(gum input --placeholder "$DEFAULT_DURATION_HOURS" --header "Duration in hours (1-$MAX_DURATION_HOURS):" --value "$DEFAULT_DURATION_HOURS")
+    if [[ -z "$duration" ]]; then
+        duration=$DEFAULT_DURATION_HOURS
+    fi
+    if ! [[ "$duration" =~ ^[0-9]+$ ]] || [[ "$duration" -lt 1 ]] || [[ "$duration" -gt "$MAX_DURATION_HOURS" ]]; then
+        gum style --foreground 196 "Invalid duration. Must be between 1 and $MAX_DURATION_HOURS hours."
+        return 1
+    fi
+
+    # Get justification
+    local justification
+    justification=$(gum input --placeholder "Enter justification..." --header "Justification (required):" --width 60)
+    if [[ -z "$justification" ]]; then
+        gum style --foreground 196 "Justification is required"
+        return 1
+    fi
+
+    echo ""
+
+    # Activate based on type
+    case "${assignment_types[$arr_index]}" in
+        tenant)
+            activate_directory_role "${assignment_data[$arr_index]}" "$duration" "$justification"
+            ;;
+        role)
+            local assignment="${assignment_data[$arr_index]}"
+            local role_def_id scope principal_id role_name schedule_id
+
+            role_def_id=$(echo "$assignment" | jq -r '.properties.roleDefinitionId')
+            scope=$(echo "$assignment" | jq -r '.properties.scope')
+            principal_id=$(echo "$assignment" | jq -r '.properties.principalId')
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+            schedule_id=$(echo "$assignment" | jq -r '.properties.roleEligibilityScheduleId')
+
+            local request_guid
+            request_guid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+
+            local request_body
+            request_body=$(jq -n \
+                --arg principalId "$principal_id" \
+                --arg roleDefinitionId "$role_def_id" \
+                --arg scheduleId "$schedule_id" \
+                --arg justification "$justification" \
+                --arg duration "PT${duration}H" \
+                '{
+                    properties: {
+                        principalId: $principalId,
+                        roleDefinitionId: $roleDefinitionId,
+                        requestType: "SelfActivate",
+                        linkedRoleEligibilityScheduleId: $scheduleId,
+                        justification: $justification,
+                        scheduleInfo: {
+                            expiration: {
+                                type: "AfterDuration",
+                                duration: $duration
+                            }
+                        }
+                    }
+                }')
+
+            local api_url="https://management.azure.com${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${request_guid}?api-version=2020-10-01"
+
+            local result
+            result=$(gum spin --spinner dot --title "Activating $role_name..." -- \
+                az rest --method PUT --url "$api_url" --headers "Content-Type=application/json" --body "$request_body" 2>&1) || {
+                local error_msg
+                error_msg=$(echo "$result" | grep -oP '"message"\s*:\s*"\K[^"]+' | head -1 || echo "$result")
+                gum style --foreground 196 "Failed to activate role: $error_msg"
+                return 1
+            }
+
+            local status
+            status=$(echo "$result" | jq -r '.properties.status // "Unknown"')
+
+            if [[ "$status" == "Provisioned" ]] || [[ "$status" == "PendingApproval" ]] || [[ "$status" == "Granted" ]]; then
+                gum style --foreground 35 --bold "✓ Role activation request submitted successfully!"
+                gum style --foreground 33 "Status: $status"
+                if [[ "$status" == "PendingApproval" ]]; then
+                    gum style --foreground 214 "This role requires approval. Please wait for an approver to approve your request."
+                fi
+            else
+                gum style --foreground 214 "Activation request status: $status"
+            fi
+            ;;
+        group)
+            local item="${assignment_data[$arr_index]}"
+            local graph_token group_id access_id principal_id group_name
+
+            graph_token=$(get_graph_token) || return 1
+            group_id=$(echo "$item" | jq -r '.groupId')
+            access_id=$(echo "$item" | jq -r '.accessId')
+            principal_id=$(echo "$item" | jq -r '.principalId')
+
+            group_name=$(curl -s -X GET \
+                -H "Authorization: Bearer $graph_token" \
+                -H "Content-Type: application/json" \
+                "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+            local request_body
+            request_body=$(jq -n \
+                --arg principalId "$principal_id" \
+                --arg groupId "$group_id" \
+                --arg accessId "$access_id" \
+                --arg justification "$justification" \
+                --arg duration "PT${duration}H" \
+                '{
+                    action: "selfActivate",
+                    principalId: $principalId,
+                    groupId: $groupId,
+                    accessId: $accessId,
+                    justification: $justification,
+                    scheduleInfo: {
+                        expiration: {
+                            type: "afterDuration",
+                            duration: $duration
+                        }
+                    }
+                }')
+
+            local result
+            result=$(gum spin --spinner dot --title "Activating $group_name..." -- \
+                curl -s -X POST \
+                -H "Authorization: Bearer $graph_token" \
+                -H "Content-Type: application/json" \
+                -d "$request_body" \
+                "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests") || {
+                gum style --foreground 196 "Failed to activate group membership"
+                return 1
+            }
+
+            if echo "$result" | jq -e '.error' &>/dev/null; then
+                local error_msg
+                error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+                gum style --foreground 196 "Failed to activate group: $error_msg"
+                return 1
+            fi
+
+            local status
+            status=$(echo "$result" | jq -r '.status // "Unknown"')
+
+            if [[ "$status" == "Provisioned" ]] || [[ "$status" == "PendingApproval" ]] || [[ "$status" == "Granted" ]]; then
+                gum style --foreground 35 --bold "✓ Group activation request submitted successfully!"
+                gum style --foreground 33 "Status: $status"
+            else
+                gum style --foreground 214 "Activation request status: $status"
+            fi
+            ;;
+    esac
+}
+
+do_deactivate() {
+    local scope="$1"
+
+    gum style --bold --foreground 212 "Deactivate Assignment"
+    echo ""
+
+    # Collect all active assignments based on scope
+    local options=()
+    local assignment_types=()
+    local assignment_data=()
+    local i=0
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local graph_token graph_user_id dir_active
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            graph_user_id=$(get_graph_user_id 2>/dev/null) || graph_user_id=""
+
+            if [[ -n "$graph_user_id" ]]; then
+                local dir_url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?\$filter=principalId%20eq%20%27${graph_user_id}%27%20and%20assignmentType%20eq%20%27Activated%27&\$expand=roleDefinition"
+
+                dir_active=$(gum spin --spinner dot --title "Fetching active Entra ID roles..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$dir_url") || dir_active=""
+
+                if [[ -n "$dir_active" ]] && ! echo "$dir_active" | jq -e '.error' &>/dev/null; then
+                    while IFS= read -r assignment; do
+                        local role_name
+                        role_name=$(echo "$assignment" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                        options+=("$((i + 1)). [Tenant] $role_name")
+                        assignment_types+=("tenant")
+                        assignment_data+=("$assignment")
+                        i=$((i + 1))
+                    done < <(echo "$dir_active" | jq -c '.value[]')
+                fi
+            fi
+        elif [[ "$scope" == "tenant" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Role (Azure subscription roles)
+    if [[ "$scope" == "all" || "$scope" == "role" ]]; then
+        check_az
+        check_login
+
+        local user_id group_ids subscription_id
+        user_id=$(get_current_user_id)
+        group_ids=$(get_user_group_ids)
+        subscription_id=$(get_subscription_id)
+
+        local url="https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01"
+
+        local all_active
+        all_active=$(gum spin --spinner dot --title "Fetching active Azure roles..." -- \
+            az rest --method GET --url "$url" 2>/dev/null) || {
+            gum style --foreground 196 "Failed to fetch active Azure role assignments"
+            return 1
+        }
+
+        local principal_ids="$user_id $group_ids"
+        local jq_filter='[.value[] | select((.properties.assignmentType == "Activated") and ('
+        local first=true
+        for pid in $principal_ids; do
+            if [[ -n "$pid" ]]; then
+                if [[ "$first" == "true" ]]; then
+                    jq_filter+=".properties.principalId == \"$pid\""
+                    first=false
+                else
+                    jq_filter+=" or .properties.principalId == \"$pid\""
+                fi
+            fi
+        done
+        jq_filter+='))]'
+
+        local active
+        active=$(echo "$all_active" | jq "$jq_filter")
+
+        while IFS= read -r assignment; do
+            local role_name scope_name
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+            scope_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.scope.displayName // "Unknown"')
+            options+=("$((i + 1)). [Role] $role_name @ $scope_name")
+            assignment_types+=("role")
+            assignment_data+=("$assignment")
+            i=$((i + 1))
+        done < <(echo "$active" | jq -c '.[]')
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local graph_token user_id
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            user_id=$(get_graph_user_id 2>/dev/null) || user_id=""
+
+            if [[ -n "$user_id" ]]; then
+                local group_url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27"
+
+                local group_result
+                group_result=$(gum spin --spinner dot --title "Fetching active PIM groups..." -- \
+                    curl -s -X GET -H "Authorization: Bearer $graph_token" -H "Content-Type: application/json" "$group_url") || group_result=""
+
+                if [[ -n "$group_result" ]] && ! echo "$group_result" | jq -e '.error' &>/dev/null; then
+                    while IFS= read -r item; do
+                        local group_id access_id group_name
+                        group_id=$(echo "$item" | jq -r '.groupId')
+                        access_id=$(echo "$item" | jq -r '.accessId')
+
+                        group_name=$(curl -s -X GET \
+                            -H "Authorization: Bearer $graph_token" \
+                            -H "Content-Type: application/json" \
+                            "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+                        options+=("$((i + 1)). [Group] $group_name ($access_id)")
+                        assignment_types+=("group")
+                        assignment_data+=("$item")
+                        i=$((i + 1))
+                    done < <(echo "$group_result" | jq -c '.value[]')
+                fi
+            fi
+        elif [[ "$scope" == "group" ]]; then
+            gum style --foreground 214 "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        gum style --foreground 214 "No active assignments to deactivate."
+        return 0
+    fi
+
+    # Use gum choose for selection
+    local selection
+    selection=$(printf '%s\n' "${options[@]}" | gum choose --header "Select assignment to deactivate:")
+
+    if [[ -z "$selection" ]]; then
+        gum style --foreground 214 "Cancelled."
+        return 0
+    fi
+
+    local sel_index
+    sel_index=$(echo "$selection" | cut -d'.' -f1)
+    local arr_index=$((sel_index - 1))
+
+    echo ""
+
+    # Deactivate based on type
+    case "${assignment_types[$arr_index]}" in
+        tenant)
+            deactivate_directory_role "${assignment_data[$arr_index]}"
+            ;;
+        role)
+            local assignment="${assignment_data[$arr_index]}"
+            local role_def_id scope principal_id role_name
+
+            role_def_id=$(echo "$assignment" | jq -r '.properties.roleDefinitionId')
+            scope=$(echo "$assignment" | jq -r '.properties.scope')
+            principal_id=$(echo "$assignment" | jq -r '.properties.principalId')
+            role_name=$(echo "$assignment" | jq -r '.properties.expandedProperties.roleDefinition.displayName // "Unknown Role"')
+
+            local request_guid
+            request_guid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+
+            local request_body
+            request_body=$(jq -n \
+                --arg principalId "$principal_id" \
+                --arg roleDefinitionId "$role_def_id" \
+                '{
+                    properties: {
+                        principalId: $principalId,
+                        roleDefinitionId: $roleDefinitionId,
+                        requestType: "SelfDeactivate"
+                    }
+                }')
+
+            local api_url="https://management.azure.com${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${request_guid}?api-version=2020-10-01"
+
+            local result
+            result=$(gum spin --spinner dot --title "Deactivating $role_name..." -- \
+                az rest --method PUT --url "$api_url" --headers "Content-Type=application/json" --body "$request_body" 2>&1) || {
+                gum style --foreground 196 "Failed to deactivate role"
+                echo "$result"
+                return 1
+            }
+
+            gum style --foreground 35 --bold "✓ Role deactivated successfully!"
+            ;;
+        group)
+            local item="${assignment_data[$arr_index]}"
+            local graph_token group_id access_id principal_id group_name
+
+            graph_token=$(get_graph_token) || return 1
+            group_id=$(echo "$item" | jq -r '.groupId')
+            access_id=$(echo "$item" | jq -r '.accessId')
+            principal_id=$(echo "$item" | jq -r '.principalId')
+
+            group_name=$(curl -s -X GET \
+                -H "Authorization: Bearer $graph_token" \
+                -H "Content-Type: application/json" \
+                "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=displayName" 2>/dev/null | jq -r '.displayName // "Unknown Group"')
+
+            local request_body
+            request_body=$(jq -n \
+                --arg principalId "$principal_id" \
+                --arg groupId "$group_id" \
+                --arg accessId "$access_id" \
+                '{
+                    action: "selfDeactivate",
+                    principalId: $principalId,
+                    groupId: $groupId,
+                    accessId: $accessId
+                }')
+
+            local result
+            result=$(gum spin --spinner dot --title "Deactivating $group_name..." -- \
+                curl -s -X POST \
+                -H "Authorization: Bearer $graph_token" \
+                -H "Content-Type: application/json" \
+                -d "$request_body" \
+                "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests") || {
+                gum style --foreground 196 "Failed to deactivate group membership"
+                return 1
+            }
+
+            if echo "$result" | jq -e '.error' &>/dev/null; then
+                local error_msg
+                error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+                gum style --foreground 196 "Failed to deactivate group: $error_msg"
+                return 1
+            fi
+
+            gum style --foreground 35 --bold "✓ Group deactivated successfully!"
+            ;;
+    esac
+}
+
+#------------------------------------------------------------------------------
 # Help and Usage
 #------------------------------------------------------------------------------
 
@@ -2325,47 +3184,126 @@ show_help() {
     gum style --foreground 252 "Azure PIM (Privileged Identity Management) CLI Tool"
     echo ""
     gum style --bold --foreground 33 "USAGE:"
-    echo "    pim.sh <command> [options]"
+    echo "    pim <action> [scope]"
+    echo ""
+    gum style --bold --foreground 33 "ACTIONS:"
+    echo "    list, l         List eligible assignments"
+    echo "    active          List active assignments"
+    echo "    activate, a     Activate an eligible assignment"
+    echo "    deactivate, d   Deactivate an active assignment"
+    echo ""
+    gum style --bold --foreground 33 "SCOPES:"
+    echo "    all             All types (default)"
+    echo "    tenant, t       Entra ID directory roles"
+    echo "    role, r         Azure subscription roles"
+    echo "    group, g        PIM groups"
+    echo ""
+    gum style --bold --foreground 33 "SHORTHAND:"
+    echo "    lt, lr, lg      List eligible (tenant/role/group)"
+    echo "    la              List active (all)"
+    echo "    lat, lar, lag   List active (tenant/role/group)"
+    echo "    at, ar, ag      Activate (tenant/role/group)"
+    echo "    dt, dr, dg      Deactivate (tenant/role/group)"
     echo ""
     gum style --bold --foreground 33 "SETUP (one-time):"
-    echo "    setup           Create app registration for PIM group permissions"
+    echo "    setup           Create app registration for PIM permissions"
     echo "    grant-consent   Grant admin consent for the app (requires admin)"
-    echo "    login           Authenticate with PIM group permissions"
+    echo "    login           Authenticate with PIM permissions"
     echo ""
-    gum style --bold --foreground 33 "COMMANDS:"
-    gum style --foreground 35 "  Azure Resource Roles:"
-    echo "    list, ls        List eligible role assignments"
-    echo "    active          List currently active role assignments"
-    echo "    activate, a     Activate an eligible role (interactive)"
-    echo "    deactivate, d   Deactivate an active role"
-    echo ""
-    gum style --foreground 35 "  Azure AD Groups (requires setup + login):"
-    echo "    groups [list]      List eligible PIM group memberships"
-    echo "    groups active      List currently active PIM group memberships"
-    echo "    groups activate    Activate an eligible group membership (interactive)"
-    echo "    groups deactivate  Deactivate an active group membership"
-    echo ""
-    gum style --foreground 35 "  Utility:"
+    gum style --bold --foreground 33 "UTILITY:"
     echo "    install         Install pim to ~/.local/bin"
     echo "    uninstall       Remove pim and optionally config"
     echo "    completions     Manage shell tab completions"
     echo "    help, h         Show this help message"
     echo ""
-    gum style --bold --foreground 33 "FIRST-TIME SETUP:"
-    echo "    1. pim.sh setup           # Create app registration"
-    echo "    2. pim.sh grant-consent   # Grant permissions (requires admin)"
-    echo "    3. pim.sh login           # Authenticate"
-    echo ""
     gum style --bold --foreground 33 "EXAMPLES:"
-    echo "    pim list                  # List eligible roles"
-    echo "    pim activate              # Interactive role activation"
-    echo "    pim groups                # List eligible PIM groups"
-    echo "    pim groups activate       # Activate a PIM group membership"
+    echo "    pim l               # List all eligible assignments"
+    echo "    pim lt              # List eligible tenant roles"
+    echo "    pim la              # List all active assignments"
+    echo "    pim lat             # List active tenant roles"
+    echo "    pim a               # Activate any assignment"
+    echo "    pim ag              # Activate a group membership"
+    echo "    pim dr              # Deactivate an Azure role"
+    echo ""
+    gum style --bold --foreground 33 "FIRST-TIME SETUP:"
+    echo "    1. az login                 # Login to Azure CLI"
+    echo "    2. pim setup                # Create app registration"
+    echo "    3. pim grant-consent        # Grant permissions (requires admin)"
+    echo "    4. pim login                # Authenticate"
 }
 
 #------------------------------------------------------------------------------
 # Main Entry Point
 #------------------------------------------------------------------------------
+
+# Parse scope argument and normalize it
+parse_scope() {
+    local scope="${1:-all}"
+    case "$scope" in
+        all|a)      echo "all" ;;
+        tenant|t)   echo "tenant" ;;
+        role|r)     echo "role" ;;
+        group|g)    echo "group" ;;
+        *)          echo "unknown" ;;
+    esac
+}
+
+# Parse combined shorthand commands like "lt", "ag", "dr", "lat", "lar", "lag"
+parse_shorthand() {
+    local cmd="$1"
+    local action="" scope=""
+
+    # Check for 3-char shorthand for list active (e.g., "lat", "lar", "lag")
+    if [[ ${#cmd} -eq 3 && "${cmd:0:2}" == "la" ]]; then
+        local third="${cmd:2:1}"
+        case "$third" in
+            t) echo "list_active tenant"; return ;;
+            r) echo "list_active role"; return ;;
+            g) echo "list_active group"; return ;;
+            *) echo "unknown"; return ;;
+        esac
+    fi
+
+    # Check for 2-char shorthand (e.g., "lt", "ag", "dr", "la")
+    if [[ ${#cmd} -eq 2 ]]; then
+        local first="${cmd:0:1}"
+        local second="${cmd:1:1}"
+
+        # Special case: "la" = list active all
+        if [[ "$first" == "l" && "$second" == "a" ]]; then
+            echo "list_active all"
+            return
+        fi
+
+        # Parse action
+        case "$first" in
+            l) action="list" ;;
+            a) action="activate" ;;
+            d) action="deactivate" ;;
+            *) echo "unknown"; return ;;
+        esac
+
+        # Parse scope
+        case "$second" in
+            t) scope="tenant" ;;
+            r) scope="role" ;;
+            g) scope="group" ;;
+            e)
+                # "le" = list eligible (same as list all)
+                if [[ "$first" == "l" ]]; then
+                    scope="all"
+                else
+                    echo "unknown"; return
+                fi
+                ;;
+            *) echo "unknown"; return ;;
+        esac
+
+        echo "$action $scope"
+    else
+        echo "unknown"
+    fi
+}
 
 main() {
     check_dependencies
@@ -2373,8 +3311,23 @@ main() {
     local command="${1:-help}"
     shift || true
 
+    # Try to parse as shorthand first (e.g., "lt", "ag", "la", "lat")
+    local parsed
+    parsed=$(parse_shorthand "$command")
+    if [[ "$parsed" != "unknown" ]]; then
+        local action scope
+        read -r action scope <<< "$parsed"
+        case "$action" in
+            list)        do_list "$scope" ;;
+            list_active) do_list_active "$scope" ;;
+            activate)    do_activate "$scope" ;;
+            deactivate)  do_deactivate "$scope" ;;
+        esac
+        return
+    fi
+
     case "$command" in
-        # Setup commands (don't require az login for some)
+        # Setup commands
         setup)
             check_login
             setup_app_registration
@@ -2386,47 +3339,49 @@ main() {
         login)
             do_device_code_login
             ;;
-        # Role commands
-        list|ls)
-            check_login
-            list_eligible_roles
+
+        # Main commands with scope support
+        list|l)
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                gum style --foreground 196 "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, role, group (or a, t, r, g)"
+                exit 1
+            fi
+            do_list "$scope"
             ;;
         active)
-            check_login
-            list_active_roles
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                gum style --foreground 196 "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, role, group (or a, t, r, g)"
+                exit 1
+            fi
+            do_list_active "$scope"
             ;;
         activate|a)
-            check_login
-            interactive_activate
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                gum style --foreground 196 "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, role, group (or a, t, r, g)"
+                exit 1
+            fi
+            do_activate "$scope"
             ;;
         deactivate|d)
-            check_login
-            deactivate_role "$@"
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                gum style --foreground 196 "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, role, group (or a, t, r, g)"
+                exit 1
+            fi
+            do_deactivate "$scope"
             ;;
-        # Group commands (use app token, not Azure CLI)
-        groups)
-            local subcommand="${1:-list}"
-            shift || true
-            case "$subcommand" in
-                list|ls)
-                    list_eligible_groups
-                    ;;
-                active)
-                    list_active_groups
-                    ;;
-                activate|a)
-                    interactive_activate_group
-                    ;;
-                deactivate|d)
-                    deactivate_group
-                    ;;
-                *)
-                    gum style --foreground 196 "Unknown groups subcommand: $subcommand"
-                    echo "Usage: pim groups [list|active|activate|deactivate]"
-                    exit 1
-                    ;;
-            esac
-            ;;
+
         # Installation commands
         install)
             do_install
@@ -2437,6 +3392,7 @@ main() {
         completions)
             handle_completions "$@"
             ;;
+
         # Help
         help|h|--help|-h)
             show_help
