@@ -41,7 +41,8 @@ Done.
 ## Features
 
 - **Unified Interface** - Manage Entra ID tenant roles, Azure subscription roles, and PIM groups from one command
-- **Shorthand Commands** - `pim lt` (list tenant), `pim ag` (activate group), `pim la` (list active)
+- **Approval Workflow** - Approve or deny PIM requests from teammates directly in the terminal
+- **Shorthand Commands** - `pim lt` (list tenant), `pim ag` (activate group), `pim pt` (pending tenant)
 - **Interactive Mode** - Beautiful TUI powered by [gum](https://github.com/charmbracelet/gum)
 - **Fast** - Batch API calls, token caching, minimal overhead
 - **Secure** - No secrets stored, uses device code auth, tokens in system keyring
@@ -101,6 +102,9 @@ pim <action> [scope]
 | `active` | | List active assignments |
 | `activate` | `a` | Activate an eligible assignment |
 | `deactivate` | `d` | Deactivate an active assignment |
+| `pending` | `p` | List pending approval requests |
+| `approve` | `y` | Approve a pending request |
+| `deny` | `n` | Deny a pending request |
 
 ### Scopes
 
@@ -130,6 +134,8 @@ Combine action + scope into 2-3 characters:
 | `pim dt` | Deactivate tenant role |
 | `pim dr` | Deactivate Azure role |
 | `pim dg` | Deactivate group membership |
+| `pim pt` | Pending tenant role approvals |
+| `pim pg` | Pending group approvals |
 
 ### Examples
 
@@ -161,6 +167,57 @@ pim ag
 # Deactivate an Azure subscription role
 pim deactivate role
 pim dr
+
+# List pending approval requests (you're an approver)
+pim pending
+pim p
+
+# List pending tenant role approvals only
+pim pending tenant
+pim pt
+
+# Approve a request (interactive picker)
+pim approve
+pim y
+
+# Deny a request with reason
+pim deny
+pim n
+```
+
+### Approval Workflow
+
+If you're configured as an approver for PIM roles or groups, you can approve or deny requests directly from the terminal:
+
+```
+$ pim p
+Pending Approval Requests
+
+  Entra ID Tenant Roles (1):
+    [tenant] Global Administrator
+             Requester: John Smith (john@contoso.com)
+             Requested: 2 hours ago
+             Reason: Need access to deploy production changes
+             ID: abc123-def456-...
+
+$ pim y
+? Select request to approve:
+> 1. [tenant] Global Administrator - John Smith
+
+? Approval justification (optional): Approved for production deployment
+
+Approving: Global Administrator
+✓ Request approved successfully!
+```
+
+For automation, you can pass the request ID directly:
+
+```bash
+# Approve with justification
+pim approve t "abc123-def456" "Approved for deployment"
+
+# Deny with required reason
+pim deny g "xyz789" "Insufficient justification provided"
 ```
 
 ## How It Works

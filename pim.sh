@@ -433,22 +433,49 @@ save_token() {
 EOF
     chmod 600 "$TOKEN_CACHE_FILE"
 
-    # Save refresh token securely using secret-tool if available
-    if [[ -n "$refresh_token" ]] && command -v secret-tool &> /dev/null; then
-        echo -n "$refresh_token" | secret-tool store --label="PIM CLI Refresh Token" \
-            application pim \
-            type refresh_token \
-            2>/dev/null || true
+    # Save refresh token securely
+    if [[ -n "$refresh_token" ]]; then
+        local refresh_file="${CONFIG_DIR}/refresh_token"
+        local saved=false
+
+        # Try secret-tool first (requires D-Bus)
+        if command -v secret-tool &> /dev/null; then
+            if echo -n "$refresh_token" | secret-tool store --label="PIM CLI Refresh Token" \
+                    application pim \
+                    type refresh_token \
+                    2>/dev/null; then
+                saved=true
+                # Remove file fallback if secret-tool succeeded
+                rm -f "$refresh_file" 2>/dev/null || true
+            fi
+        fi
+
+        # Fallback to file storage if secret-tool failed or not available
+        if [[ "$saved" != "true" ]]; then
+            echo -n "$refresh_token" > "$refresh_file"
+            chmod 600 "$refresh_file"
+        fi
     fi
 }
 
 # Get refresh token from secure storage
 get_refresh_token() {
+    local token=""
+
+    # Try secret-tool first
     if command -v secret-tool &> /dev/null; then
-        secret-tool lookup application pim type refresh_token 2>/dev/null || echo ""
-    else
-        echo ""
+        token=$(secret-tool lookup application pim type refresh_token 2>/dev/null) || token=""
     fi
+
+    # Fallback to file storage
+    if [[ -z "$token" ]]; then
+        local refresh_file="${CONFIG_DIR}/refresh_token"
+        if [[ -f "$refresh_file" ]]; then
+            token=$(cat "$refresh_file" 2>/dev/null) || token=""
+        fi
+    fi
+
+    echo "$token"
 }
 
 # Refresh the access token using the refresh token
@@ -2069,6 +2096,221 @@ deactivate_group() {
 }
 
 #------------------------------------------------------------------------------
+# PIM Approval Functions
+#------------------------------------------------------------------------------
+
+# Fetch pending approval requests for directory roles (where current user is approver)
+get_pending_directory_role_approvals() {
+    local url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on=%27approver%27)?\$filter=status%20eq%20%27PendingApproval%27&\$expand=principal,roleDefinition"
+    graph_request GET "$url"
+}
+
+# Fetch pending approval requests for groups (where current user is approver)
+get_pending_group_approvals() {
+    local url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on=%27approver%27)?\$filter=status%20eq%20%27PendingApproval%27&\$expand=principal"
+    graph_request GET "$url"
+}
+
+# Get the approval stages for a directory role request
+get_directory_role_approval_stages() {
+    local request_id="$1"
+    local url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentApprovals/${request_id}/stages"
+    graph_request GET "$url"
+}
+
+# Get the approval stages for a group request
+get_group_approval_stages() {
+    local request_id="$1"
+    local url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentApprovals/${request_id}/stages"
+    graph_request GET "$url"
+}
+
+# Approve or deny a directory role request
+# Usage: approve_or_deny_directory_role <request_id> <approve|deny> <justification>
+approve_or_deny_directory_role() {
+    local request_id="$1"
+    local action="$2"  # "Approve" or "Deny"
+    local justification="${3:-Processed via PIM CLI}"
+
+    local graph_token
+    graph_token=$(get_graph_token) || {
+        out_styled error "Not logged in. Please run 'pim login' first."
+        return 1
+    }
+
+    # Get the approval stages
+    local stages_result
+    stages_result=$(get_directory_role_approval_stages "$request_id") || {
+        out_styled error "Failed to get approval stages"
+        return 1
+    }
+
+    if echo "$stages_result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$stages_result" | jq -r '.error.message // "Unknown error"')
+        out_styled error "Failed to get approval stages: $error_msg"
+        return 1
+    fi
+
+    # Get the first pending stage
+    local stage_id
+    stage_id=$(echo "$stages_result" | jq -r '.value[] | select(.status == "InProgress") | .id' | head -1)
+
+    if [[ -z "$stage_id" || "$stage_id" == "null" ]]; then
+        out_styled error "No pending approval stage found"
+        return 1
+    fi
+
+    # Update the approval stage
+    local request_body
+    request_body=$(jq -n \
+        --arg reviewResult "$action" \
+        --arg justification "$justification" \
+        '{
+            reviewResult: $reviewResult,
+            justification: $justification
+        }')
+
+    local url="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentApprovals/${request_id}/stages/${stage_id}"
+
+    local result
+    result=$(curl -s -X PATCH \
+        -H "Authorization: Bearer $graph_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "$url")
+
+    # Check for errors - PATCH returns 204 No Content on success, so empty result is OK
+    if [[ -n "$result" ]] && echo "$result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+        out_styled error "Failed to ${action,,} request: $error_msg"
+        return 1
+    fi
+
+    return 0
+}
+
+# Approve or deny a group request
+# Usage: approve_or_deny_group <request_id> <approve|deny> <justification>
+approve_or_deny_group() {
+    local request_id="$1"
+    local action="$2"  # "Approve" or "Deny"
+    local justification="${3:-Processed via PIM CLI}"
+
+    local graph_token
+    graph_token=$(get_graph_token) || {
+        out_styled error "Not logged in. Please run 'pim login' first."
+        return 1
+    }
+
+    # Get the approval stages
+    local stages_result
+    stages_result=$(get_group_approval_stages "$request_id") || {
+        out_styled error "Failed to get approval stages"
+        return 1
+    }
+
+    if echo "$stages_result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$stages_result" | jq -r '.error.message // "Unknown error"')
+        out_styled error "Failed to get approval stages: $error_msg"
+        return 1
+    fi
+
+    # Get the first pending stage
+    local stage_id
+    stage_id=$(echo "$stages_result" | jq -r '.value[] | select(.status == "InProgress") | .id' | head -1)
+
+    if [[ -z "$stage_id" || "$stage_id" == "null" ]]; then
+        out_styled error "No pending approval stage found"
+        return 1
+    fi
+
+    # Update the approval stage
+    local request_body
+    request_body=$(jq -n \
+        --arg reviewResult "$action" \
+        --arg justification "$justification" \
+        '{
+            reviewResult: $reviewResult,
+            justification: $justification
+        }')
+
+    local url="https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentApprovals/${request_id}/stages/${stage_id}"
+
+    local result
+    result=$(curl -s -X PATCH \
+        -H "Authorization: Bearer $graph_token" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "$url")
+
+    # Check for errors - PATCH returns 204 No Content on success, so empty result is OK
+    if [[ -n "$result" ]] && echo "$result" | jq -e '.error' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$result" | jq -r '.error.message // "Unknown error"')
+        out_styled error "Failed to ${action,,} request: $error_msg"
+        return 1
+    fi
+
+    return 0
+}
+
+# Get requester display name from principal info
+get_requester_name() {
+    local principal_id="$1"
+    local result
+    result=$(graph_request GET "https://graph.microsoft.com/v1.0/users/${principal_id}?\$select=displayName,userPrincipalName" 2>/dev/null)
+
+    if [[ -n "$result" ]] && ! echo "$result" | jq -e '.error' &>/dev/null; then
+        local name upn
+        name=$(echo "$result" | jq -r '.displayName // empty')
+        upn=$(echo "$result" | jq -r '.userPrincipalName // empty')
+        if [[ -n "$name" && -n "$upn" ]]; then
+            echo "$name ($upn)"
+        elif [[ -n "$name" ]]; then
+            echo "$name"
+        elif [[ -n "$upn" ]]; then
+            echo "$upn"
+        else
+            echo "Unknown"
+        fi
+    else
+        echo "Unknown"
+    fi
+}
+
+# Format time ago from ISO date
+format_time_ago() {
+    local iso_date="$1"
+    if [[ -z "$iso_date" || "$iso_date" == "null" ]]; then
+        echo "Unknown"
+        return
+    fi
+
+    local timestamp
+    timestamp=$(date -d "$iso_date" +%s 2>/dev/null) || {
+        echo "$iso_date"
+        return
+    }
+
+    local now diff
+    now=$(date +%s)
+    diff=$((now - timestamp))
+
+    if [[ $diff -lt 60 ]]; then
+        echo "Just now"
+    elif [[ $diff -lt 3600 ]]; then
+        echo "$((diff / 60)) minutes ago"
+    elif [[ $diff -lt 86400 ]]; then
+        echo "$((diff / 3600)) hours ago"
+    else
+        echo "$((diff / 86400)) days ago"
+    fi
+}
+
+#------------------------------------------------------------------------------
 # Installation and Completions
 #------------------------------------------------------------------------------
 
@@ -2085,9 +2327,9 @@ _pim() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="list l active activate a deactivate d setup grant-consent login help h install uninstall completions"
+    commands="list l active activate a deactivate d pending p approve y deny n setup grant-consent login help h install uninstall completions"
     scopes="all tenant t role r group g"
-    shorthand="lt lr lg la lat lar lag at ar ag dt dr dg"
+    shorthand="lt lr lg la lat lar lag at ar ag dt dr dg pt pg"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands} ${shorthand}" -- "${cur}") )
@@ -2095,7 +2337,7 @@ _pim() {
     fi
 
     case "${prev}" in
-        list|l|active|activate|a|deactivate|d)
+        list|l|active|activate|a|deactivate|d|pending|p|approve|deny)
             COMPREPLY=( $(compgen -W "${scopes}" -- "${cur}") )
             return 0
             ;;
@@ -2127,6 +2369,12 @@ _pim() {
         'a:Activate an eligible assignment'
         'deactivate:Deactivate an active assignment'
         'd:Deactivate an active assignment'
+        'pending:List pending approval requests'
+        'p:List pending approval requests'
+        'approve:Approve a pending request'
+        'y:Approve a pending request'
+        'deny:Deny a pending request'
+        'n:Deny a pending request'
         'setup:Create app registration for PIM permissions'
         'grant-consent:Grant admin consent for the app (requires admin)'
         'login:Authenticate with PIM permissions'
@@ -2148,6 +2396,8 @@ _pim() {
         'dt:Deactivate tenant role'
         'dr:Deactivate Azure role'
         'dg:Deactivate group membership'
+        'pt:Pending tenant role approvals'
+        'pg:Pending group approvals'
     )
 
     scopes=(
@@ -2170,7 +2420,7 @@ _pim() {
             ;;
         args)
             case $words[2] in
-                list|l|active|activate|a|deactivate|d)
+                list|l|active|activate|a|deactivate|d|pending|p|approve|deny)
                     _describe -t scopes 'scope' scopes
                     ;;
                 completions)
@@ -2685,6 +2935,475 @@ do_list_active() {
     if [[ "$has_results" == "false" ]]; then
         out_styled warning "No active assignments found."
     fi
+}
+
+do_list_pending() {
+    local scope="$1"
+
+    out_styled header "Pending Approval Requests"
+    echo ""
+
+    local has_results=false
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local graph_token
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            local pending_result
+            # Call function directly - gum spin can't capture output from bash functions
+            pending_result=$(get_pending_directory_role_approvals 2>/dev/null) || pending_result=""
+
+            if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
+                local pending_count
+                pending_count=$(echo "$pending_result" | jq '.value | length // 0')
+
+                if [[ "$pending_count" -gt 0 ]]; then
+                    has_results=true
+                    out_styled info "  Entra ID Tenant Roles ($pending_count):"
+                    while IFS= read -r request; do
+                        local role_name requester_name created_time justification request_id principal_id
+                        request_id=$(echo "$request" | jq -r '.id')
+                        role_name=$(echo "$request" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                        principal_id=$(echo "$request" | jq -r '.principalId')
+                        created_time=$(echo "$request" | jq -r '.createdDateTime // "Unknown"')
+                        justification=$(echo "$request" | jq -r '.justification // "No justification provided"')
+
+                        # Get requester name from expanded principal or fetch it
+                        local display_name upn
+                        display_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                        upn=$(echo "$request" | jq -r '.principal.userPrincipalName // empty')
+                        if [[ -n "$display_name" && -n "$upn" ]]; then
+                            requester_name="$display_name ($upn)"
+                        elif [[ -n "$display_name" ]]; then
+                            requester_name="$display_name"
+                        elif [[ -n "$upn" ]]; then
+                            requester_name="$upn"
+                        else
+                            requester_name=$(get_requester_name "$principal_id")
+                        fi
+
+                        local time_ago
+                        time_ago=$(format_time_ago "$created_time")
+
+                        out_styled item "    [tenant] $role_name"
+                        out_styled dim "             Requester: $requester_name"
+                        out_styled dim "             Requested: $time_ago"
+                        out_styled dim "             Reason: $justification"
+                        out_styled dim "             ID: $request_id"
+                        echo ""
+                    done < <(echo "$pending_result" | jq -c '.value[]')
+                fi
+            fi
+        elif [[ "$scope" == "tenant" ]]; then
+            out_styled warning "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local graph_token
+        graph_token=$(get_graph_token 2>/dev/null) || graph_token=""
+
+        if [[ -n "$graph_token" ]]; then
+            local pending_result
+            # Call function directly - gum spin can't capture output from bash functions
+            pending_result=$(get_pending_group_approvals 2>/dev/null) || pending_result=""
+            if [[ -n "$pending_result" ]]; then
+                # Check for API errors and display them
+                if echo "$pending_result" | jq -e '.error' &>/dev/null; then
+                    local error_msg error_code
+                    error_msg=$(echo "$pending_result" | jq -r '.error.message // "Unknown error"')
+                    error_code=$(echo "$pending_result" | jq -r '.error.code // "Unknown"')
+                    out_styled warning "API Error (group approvals): [$error_code] $error_msg"
+                else
+                    local pending_count
+                    pending_count=$(echo "$pending_result" | jq '.value | length // 0')
+
+                    if [[ "$pending_count" -gt 0 ]]; then
+                        has_results=true
+                        out_styled info "  PIM Groups ($pending_count):"
+                        while IFS= read -r request; do
+                            local group_id group_name access_id requester_name created_time justification request_id
+                            request_id=$(echo "$request" | jq -r '.id')
+                            group_id=$(echo "$request" | jq -r '.groupId')
+                            access_id=$(echo "$request" | jq -r '.accessId')
+                            created_time=$(echo "$request" | jq -r '.createdDateTime // "Unknown"')
+                            justification=$(echo "$request" | jq -r '.justification // "No justification provided"')
+
+                            # Get group name and requester from expanded principal
+                            group_name=$(get_group_name "$group_id")
+                            local display_name upn
+                            display_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                            upn=$(echo "$request" | jq -r '.principal.userPrincipalName // empty')
+                            if [[ -n "$display_name" && -n "$upn" ]]; then
+                                requester_name="$display_name ($upn)"
+                            elif [[ -n "$display_name" ]]; then
+                                requester_name="$display_name"
+                            elif [[ -n "$upn" ]]; then
+                                requester_name="$upn"
+                            else
+                                requester_name="Unknown"
+                            fi
+
+                            local time_ago
+                            time_ago=$(format_time_ago "$created_time")
+
+                            out_styled item "    [group] $group_name ($access_id)"
+                            out_styled dim "             Requester: $requester_name"
+                            out_styled dim "             Requested: $time_ago"
+                            out_styled dim "             Reason: $justification"
+                            out_styled dim "             ID: $request_id"
+                            echo ""
+                        done < <(echo "$pending_result" | jq -c '.value[]')
+                    fi
+                fi
+            fi
+        elif [[ "$scope" == "group" ]]; then
+            out_styled warning "Not logged in to Graph API. Run 'pim login' first."
+            return 1
+        fi
+    fi
+
+    # Note: Azure subscription roles (scope=role) approval via ARM API is more complex
+    # and typically handled through Azure Portal or PowerShell. Skipping for now.
+    if [[ "$scope" == "role" ]]; then
+        out_styled warning "Azure subscription role approvals are not yet supported via CLI."
+        out_styled info "Please use the Azure Portal to approve Azure role requests."
+    fi
+
+    if [[ "$has_results" == "false" && "$scope" != "role" ]]; then
+        out_styled info "No pending approval requests found."
+    fi
+}
+
+do_approve() {
+    local scope="$1"
+    shift
+    local request_name="${1:-}"
+    local justification="${2:-}"
+
+    out_styled header "Approve Request"
+    echo ""
+
+    local graph_token
+    graph_token=$(get_graph_token 2>/dev/null) || {
+        out_styled error "Not logged in to Graph API. Run 'pim login' first."
+        return 1
+    }
+
+    # Collect all pending requests
+    local options=()
+    local request_ids=()
+    local request_types=()
+    local request_names=()
+    local i=0
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local pending_result
+        # Call function directly - gum spin can't capture output from bash functions
+        pending_result=$(get_pending_directory_role_approvals 2>/dev/null) || pending_result=""
+
+        if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
+            while IFS= read -r request; do
+                local role_name requester_name request_id principal_id justification_text
+                request_id=$(echo "$request" | jq -r '.id')
+                role_name=$(echo "$request" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                principal_id=$(echo "$request" | jq -r '.principalId')
+                justification_text=$(echo "$request" | jq -r '.justification // "No justification"')
+
+                requester_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                if [[ -z "$requester_name" ]]; then
+                    requester_name=$(get_requester_name "$principal_id")
+                fi
+
+                options+=("$((i + 1)). [tenant] $role_name - $requester_name")
+                request_ids+=("$request_id")
+                request_types+=("tenant")
+                request_names+=("$role_name")
+                ((++i))
+            done < <(echo "$pending_result" | jq -c '.value[]')
+        fi
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local pending_result
+        # Call function directly - gum spin can't capture output from bash functions
+        pending_result=$(get_pending_group_approvals 2>/dev/null) || pending_result=""
+
+        if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
+            while IFS= read -r request; do
+                local group_id group_name access_id requester_name request_id
+                request_id=$(echo "$request" | jq -r '.id')
+                group_id=$(echo "$request" | jq -r '.groupId')
+                access_id=$(echo "$request" | jq -r '.accessId')
+
+                group_name=$(get_group_name "$group_id")
+                # Get requester from expanded principal
+                local display_name upn
+                display_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                upn=$(echo "$request" | jq -r '.principal.userPrincipalName // empty')
+                if [[ -n "$display_name" && -n "$upn" ]]; then
+                    requester_name="$display_name ($upn)"
+                elif [[ -n "$display_name" ]]; then
+                    requester_name="$display_name"
+                elif [[ -n "$upn" ]]; then
+                    requester_name="$upn"
+                else
+                    requester_name="Unknown"
+                fi
+
+                options+=("$((i + 1)). [group] $group_name ($access_id) - $requester_name")
+                request_ids+=("$request_id")
+                request_types+=("group")
+                request_names+=("$group_name")
+                ((++i))
+            done < <(echo "$pending_result" | jq -c '.value[]')
+        fi
+    fi
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        out_styled info "No pending approval requests found."
+        return 0
+    fi
+
+    local selection sel_index arr_index
+
+    # Non-interactive mode: match by name or ID
+    if [[ -n "$request_name" ]]; then
+        for idx in "${!request_names[@]}"; do
+            if [[ "${request_names[$idx]}" == "$request_name" ]] || [[ "${request_ids[$idx]}" == "$request_name" ]]; then
+                arr_index=$idx
+                break
+            fi
+        done
+
+        if [[ -z "$arr_index" ]]; then
+            out_styled error "No pending request found matching: $request_name"
+            return 1
+        fi
+    else
+        # Interactive selection
+        if [[ "$IS_INTERACTIVE" != "true" ]]; then
+            out_styled error "Non-interactive mode requires request name/ID argument"
+            echo "Usage: pim approve [scope] <request-name-or-id> [justification]"
+            return 1
+        fi
+
+        selection=$(printf '%s\n' "${options[@]}" | gum choose --header "Select request to approve:")
+
+        if [[ -z "$selection" ]]; then
+            out_styled warning "No selection made"
+            return 1
+        fi
+
+        sel_index=$(echo "$selection" | cut -d'.' -f1)
+        arr_index=$((sel_index - 1))
+    fi
+
+    local selected_id="${request_ids[$arr_index]}"
+    local selected_type="${request_types[$arr_index]}"
+    local selected_name="${request_names[$arr_index]}"
+
+    # Get justification if not provided
+    if [[ -z "$justification" && "$IS_INTERACTIVE" == "true" ]]; then
+        justification=$(gum input --placeholder "Approval justification (optional)..." --width 60)
+    fi
+    justification="${justification:-Approved via PIM CLI}"
+
+    out_styled info "Approving: $selected_name"
+
+    # Perform approval - call functions directly (gum spin can't run bash functions)
+    local result
+    case "$selected_type" in
+        tenant)
+            if result=$(approve_or_deny_directory_role "$selected_id" "Approve" "$justification" 2>&1); then
+                out_styled success "Request approved successfully!"
+            else
+                out_styled error "Failed to approve request"
+                [[ -n "$result" ]] && echo "$result"
+                return 1
+            fi
+            ;;
+        group)
+            if result=$(approve_or_deny_group "$selected_id" "Approve" "$justification" 2>&1); then
+                out_styled success "Request approved successfully!"
+            else
+                out_styled error "Failed to approve request"
+                [[ -n "$result" ]] && echo "$result"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+do_deny() {
+    local scope="$1"
+    shift
+    local request_name="${1:-}"
+    local justification="${2:-}"
+
+    out_styled header "Deny Request"
+    echo ""
+
+    local graph_token
+    graph_token=$(get_graph_token 2>/dev/null) || {
+        out_styled error "Not logged in to Graph API. Run 'pim login' first."
+        return 1
+    }
+
+    # Collect all pending requests
+    local options=()
+    local request_ids=()
+    local request_types=()
+    local request_names=()
+    local i=0
+
+    # Tenant (Entra ID directory roles)
+    if [[ "$scope" == "all" || "$scope" == "tenant" ]]; then
+        local pending_result
+        # Call function directly - gum spin can't capture output from bash functions
+        pending_result=$(get_pending_directory_role_approvals 2>/dev/null) || pending_result=""
+
+        if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
+            while IFS= read -r request; do
+                local role_name requester_name request_id principal_id
+                request_id=$(echo "$request" | jq -r '.id')
+                role_name=$(echo "$request" | jq -r '.roleDefinition.displayName // "Unknown Role"')
+                principal_id=$(echo "$request" | jq -r '.principalId')
+
+                requester_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                if [[ -z "$requester_name" ]]; then
+                    requester_name=$(get_requester_name "$principal_id")
+                fi
+
+                options+=("$((i + 1)). [tenant] $role_name - $requester_name")
+                request_ids+=("$request_id")
+                request_types+=("tenant")
+                request_names+=("$role_name")
+                ((++i))
+            done < <(echo "$pending_result" | jq -c '.value[]')
+        fi
+    fi
+
+    # Group (PIM groups)
+    if [[ "$scope" == "all" || "$scope" == "group" ]]; then
+        local pending_result
+        # Call function directly - gum spin can't capture output from bash functions
+        pending_result=$(get_pending_group_approvals 2>/dev/null) || pending_result=""
+
+        if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
+            while IFS= read -r request; do
+                local group_id group_name access_id requester_name request_id
+                request_id=$(echo "$request" | jq -r '.id')
+                group_id=$(echo "$request" | jq -r '.groupId')
+                access_id=$(echo "$request" | jq -r '.accessId')
+
+                group_name=$(get_group_name "$group_id")
+                # Get requester from expanded principal
+                local display_name upn
+                display_name=$(echo "$request" | jq -r '.principal.displayName // empty')
+                upn=$(echo "$request" | jq -r '.principal.userPrincipalName // empty')
+                if [[ -n "$display_name" && -n "$upn" ]]; then
+                    requester_name="$display_name ($upn)"
+                elif [[ -n "$display_name" ]]; then
+                    requester_name="$display_name"
+                elif [[ -n "$upn" ]]; then
+                    requester_name="$upn"
+                else
+                    requester_name="Unknown"
+                fi
+
+                options+=("$((i + 1)). [group] $group_name ($access_id) - $requester_name")
+                request_ids+=("$request_id")
+                request_types+=("group")
+                request_names+=("$group_name")
+                ((++i))
+            done < <(echo "$pending_result" | jq -c '.value[]')
+        fi
+    fi
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        out_styled info "No pending approval requests found."
+        return 0
+    fi
+
+    local selection sel_index arr_index
+
+    # Non-interactive mode: match by name or ID
+    if [[ -n "$request_name" ]]; then
+        for idx in "${!request_names[@]}"; do
+            if [[ "${request_names[$idx]}" == "$request_name" ]] || [[ "${request_ids[$idx]}" == "$request_name" ]]; then
+                arr_index=$idx
+                break
+            fi
+        done
+
+        if [[ -z "$arr_index" ]]; then
+            out_styled error "No pending request found matching: $request_name"
+            return 1
+        fi
+    else
+        # Interactive selection
+        if [[ "$IS_INTERACTIVE" != "true" ]]; then
+            out_styled error "Non-interactive mode requires request name/ID argument"
+            echo "Usage: pim deny [scope] <request-name-or-id> [justification]"
+            return 1
+        fi
+
+        selection=$(printf '%s\n' "${options[@]}" | gum choose --header "Select request to deny:")
+
+        if [[ -z "$selection" ]]; then
+            out_styled warning "No selection made"
+            return 1
+        fi
+
+        sel_index=$(echo "$selection" | cut -d'.' -f1)
+        arr_index=$((sel_index - 1))
+    fi
+
+    local selected_id="${request_ids[$arr_index]}"
+    local selected_type="${request_types[$arr_index]}"
+    local selected_name="${request_names[$arr_index]}"
+
+    # Get justification - required for denials
+    if [[ -z "$justification" && "$IS_INTERACTIVE" == "true" ]]; then
+        justification=$(gum input --placeholder "Denial reason (required)..." --width 60)
+    fi
+
+    if [[ -z "$justification" ]]; then
+        out_styled error "Justification is required when denying a request"
+        return 1
+    fi
+
+    out_styled info "Denying: $selected_name"
+
+    # Perform denial - call functions directly (gum spin can't run bash functions)
+    local result
+    case "$selected_type" in
+        tenant)
+            if result=$(approve_or_deny_directory_role "$selected_id" "Deny" "$justification" 2>&1); then
+                out_styled success "Request denied successfully!"
+            else
+                out_styled error "Failed to deny request"
+                [[ -n "$result" ]] && echo "$result"
+                return 1
+            fi
+            ;;
+        group)
+            if result=$(approve_or_deny_group "$selected_id" "Deny" "$justification" 2>&1); then
+                out_styled success "Request denied successfully!"
+            else
+                out_styled error "Failed to deny request"
+                [[ -n "$result" ]] && echo "$result"
+                return 1
+            fi
+            ;;
+    esac
 }
 
 do_activate() {
@@ -3374,6 +4093,9 @@ show_help() {
     echo "    active          List active assignments"
     echo "    activate, a     Activate an eligible assignment"
     echo "    deactivate, d   Deactivate an active assignment"
+    echo "    pending, p      List pending approval requests"
+    echo "    approve, y      Approve a pending request"
+    echo "    deny, n         Deny a pending request"
     echo ""
     out_styled header "SCOPES:"
     echo "    all             All types (default)"
@@ -3387,6 +4109,7 @@ show_help() {
     echo "    lat, lar, lag   List active (tenant/role/group)"
     echo "    at, ar, ag      Activate (tenant/role/group)"
     echo "    dt, dr, dg      Deactivate (tenant/role/group)"
+    echo "    pt, pg          Pending approvals (tenant/group)"
     echo ""
     out_styled header "NON-INTERACTIVE MODE (for scripts/automation):"
     echo "    pim ag <name> <hours> <justification>  # Activate group by name"
@@ -3395,6 +4118,8 @@ show_help() {
     echo "    pim dg <name>                          # Deactivate group by name"
     echo "    pim dt <name>                          # Deactivate tenant role"
     echo "    pim dr <name>                          # Deactivate Azure role"
+    echo "    pim approve t <id> <justification>     # Approve tenant role request"
+    echo "    pim deny g <id> <reason>               # Deny group request"
     echo ""
     out_styled header "SETUP (one-time):"
     echo "    setup           Create app registration for PIM permissions"
@@ -3414,6 +4139,10 @@ show_help() {
     echo "    pim ag                                  # Activate a group (interactive)"
     echo "    pim ag 'Security Admins' 4 'Deploying' # Activate group directly"
     echo "    pim dg 'Security Admins'               # Deactivate group directly"
+    echo "    pim p                                   # List pending approvals"
+    echo "    pim pt                                  # List pending tenant role approvals"
+    echo "    pim approve                             # Approve a request (interactive)"
+    echo "    pim deny                                # Deny a request (interactive)"
     echo ""
     out_styled header "FIRST-TIME SETUP:"
     echo "    1. az login                 # Login to Azure CLI"
@@ -3454,7 +4183,7 @@ parse_shorthand() {
         esac
     fi
 
-    # Check for 2-char shorthand (e.g., "lt", "ag", "dr", "la")
+    # Check for 2-char shorthand (e.g., "lt", "ag", "dr", "la", "pt", "pg")
     if [[ ${#cmd} -eq 2 ]]; then
         local first="${cmd:0:1}"
         local second="${cmd:1:1}"
@@ -3463,6 +4192,15 @@ parse_shorthand() {
         if [[ "$first" == "l" && "$second" == "a" ]]; then
             echo "list_active all"
             return
+        fi
+
+        # Special case: "pt", "pg" = pending tenant/group
+        if [[ "$first" == "p" ]]; then
+            case "$second" in
+                t) echo "list_pending tenant"; return ;;
+                g) echo "list_pending group"; return ;;
+                *) echo "unknown"; return ;;
+            esac
         fi
 
         # Parse action
@@ -3501,17 +4239,18 @@ main() {
     local command="${1:-help}"
     shift || true
 
-    # Try to parse as shorthand first (e.g., "lt", "ag", "la", "lat")
+    # Try to parse as shorthand first (e.g., "lt", "ag", "la", "lat", "pt", "pg")
     local parsed
     parsed=$(parse_shorthand "$command")
     if [[ "$parsed" != "unknown" ]]; then
         local action scope
         read -r action scope <<< "$parsed"
         case "$action" in
-            list)        do_list "$scope" ;;
-            list_active) do_list_active "$scope" ;;
-            activate)    do_activate "$scope" "$@" ;;
-            deactivate)  do_deactivate "$scope" "$@" ;;
+            list)         do_list "$scope" ;;
+            list_active)  do_list_active "$scope" ;;
+            list_pending) do_list_pending "$scope" ;;
+            activate)     do_activate "$scope" "$@" ;;
+            deactivate)   do_deactivate "$scope" "$@" ;;
         esac
         return
     fi
@@ -3572,6 +4311,40 @@ main() {
             fi
             shift || true
             do_deactivate "$scope" "$@"
+            ;;
+
+        # Approval commands
+        pending|p)
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                out_styled error "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, group (or a, t, g)"
+                exit 1
+            fi
+            do_list_pending "$scope"
+            ;;
+        approve|y)
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                out_styled error "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, group (or a, t, g)"
+                exit 1
+            fi
+            shift || true
+            do_approve "$scope" "$@"
+            ;;
+        deny|n)
+            local scope
+            scope=$(parse_scope "${1:-all}")
+            if [[ "$scope" == "unknown" ]]; then
+                out_styled error "Unknown scope: $1"
+                echo "Valid scopes: all, tenant, group (or a, t, g)"
+                exit 1
+            fi
+            shift || true
+            do_deny "$scope" "$@"
             ;;
 
         # Installation commands
