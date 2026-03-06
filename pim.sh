@@ -3099,6 +3099,8 @@ do_approve() {
     local request_ids=()
     local request_types=()
     local request_names=()
+    local request_justifications=()
+    local request_requesters=()
     local i=0
 
     # Tenant (Entra ID directory roles)
@@ -3113,7 +3115,7 @@ do_approve() {
                 request_id=$(echo "$request" | jq -r '.id')
                 role_name=$(echo "$request" | jq -r '.roleDefinition.displayName // "Unknown Role"')
                 principal_id=$(echo "$request" | jq -r '.principalId')
-                justification_text=$(echo "$request" | jq -r '.justification // "No justification"')
+                justification_text=$(echo "$request" | jq -r '.justification // "No justification provided"')
 
                 requester_name=$(echo "$request" | jq -r '.principal.displayName // empty')
                 if [[ -z "$requester_name" ]]; then
@@ -3124,6 +3126,8 @@ do_approve() {
                 request_ids+=("$request_id")
                 request_types+=("tenant")
                 request_names+=("$role_name")
+                request_justifications+=("$justification_text")
+                request_requesters+=("$requester_name")
                 ((++i))
             done < <(echo "$pending_result" | jq -c '.value[]')
         fi
@@ -3137,10 +3141,11 @@ do_approve() {
 
         if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
             while IFS= read -r request; do
-                local group_id group_name access_id requester_name request_id
+                local group_id group_name access_id requester_name request_id justification_text
                 request_id=$(echo "$request" | jq -r '.id')
                 group_id=$(echo "$request" | jq -r '.groupId')
                 access_id=$(echo "$request" | jq -r '.accessId')
+                justification_text=$(echo "$request" | jq -r '.justification // "No justification provided"')
 
                 group_name=$(get_group_name "$group_id")
                 # Get requester from expanded principal
@@ -3161,6 +3166,8 @@ do_approve() {
                 request_ids+=("$request_id")
                 request_types+=("group")
                 request_names+=("$group_name")
+                request_justifications+=("$justification_text")
+                request_requesters+=("$requester_name")
                 ((++i))
             done < <(echo "$pending_result" | jq -c '.value[]')
         fi
@@ -3208,6 +3215,14 @@ do_approve() {
     local selected_id="${request_ids[$arr_index]}"
     local selected_type="${request_types[$arr_index]}"
     local selected_name="${request_names[$arr_index]}"
+    local selected_justification="${request_justifications[$arr_index]}"
+    local selected_requester="${request_requesters[$arr_index]}"
+
+    # Display request details including requester's reason
+    echo ""
+    out_styled dim "  Requester: $selected_requester"
+    out_styled dim "  Reason:    $selected_justification"
+    echo ""
 
     # Get justification if not provided
     if [[ -z "$justification" && "$IS_INTERACTIVE" == "true" ]]; then
@@ -3261,6 +3276,8 @@ do_deny() {
     local request_ids=()
     local request_types=()
     local request_names=()
+    local request_justifications=()
+    local request_requesters=()
     local i=0
 
     # Tenant (Entra ID directory roles)
@@ -3271,10 +3288,11 @@ do_deny() {
 
         if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
             while IFS= read -r request; do
-                local role_name requester_name request_id principal_id
+                local role_name requester_name request_id principal_id justification_text
                 request_id=$(echo "$request" | jq -r '.id')
                 role_name=$(echo "$request" | jq -r '.roleDefinition.displayName // "Unknown Role"')
                 principal_id=$(echo "$request" | jq -r '.principalId')
+                justification_text=$(echo "$request" | jq -r '.justification // "No justification provided"')
 
                 requester_name=$(echo "$request" | jq -r '.principal.displayName // empty')
                 if [[ -z "$requester_name" ]]; then
@@ -3285,6 +3303,8 @@ do_deny() {
                 request_ids+=("$request_id")
                 request_types+=("tenant")
                 request_names+=("$role_name")
+                request_justifications+=("$justification_text")
+                request_requesters+=("$requester_name")
                 ((++i))
             done < <(echo "$pending_result" | jq -c '.value[]')
         fi
@@ -3298,10 +3318,11 @@ do_deny() {
 
         if [[ -n "$pending_result" ]] && ! echo "$pending_result" | jq -e '.error' &>/dev/null; then
             while IFS= read -r request; do
-                local group_id group_name access_id requester_name request_id
+                local group_id group_name access_id requester_name request_id justification_text
                 request_id=$(echo "$request" | jq -r '.id')
                 group_id=$(echo "$request" | jq -r '.groupId')
                 access_id=$(echo "$request" | jq -r '.accessId')
+                justification_text=$(echo "$request" | jq -r '.justification // "No justification provided"')
 
                 group_name=$(get_group_name "$group_id")
                 # Get requester from expanded principal
@@ -3322,6 +3343,8 @@ do_deny() {
                 request_ids+=("$request_id")
                 request_types+=("group")
                 request_names+=("$group_name")
+                request_justifications+=("$justification_text")
+                request_requesters+=("$requester_name")
                 ((++i))
             done < <(echo "$pending_result" | jq -c '.value[]')
         fi
@@ -3369,6 +3392,14 @@ do_deny() {
     local selected_id="${request_ids[$arr_index]}"
     local selected_type="${request_types[$arr_index]}"
     local selected_name="${request_names[$arr_index]}"
+    local selected_justification="${request_justifications[$arr_index]}"
+    local selected_requester="${request_requesters[$arr_index]}"
+
+    # Display request details including requester's reason
+    echo ""
+    out_styled dim "  Requester: $selected_requester"
+    out_styled dim "  Reason:    $selected_justification"
+    echo ""
 
     # Get justification - required for denials
     if [[ -z "$justification" && "$IS_INTERACTIVE" == "true" ]]; then
